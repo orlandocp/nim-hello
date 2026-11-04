@@ -15,19 +15,13 @@ No external packages: just `HttpClient` + `System.Text.Json`.
 
 ## 2. Configure the key
 
-PowerShell (current session only):
-
-```powershell
-$env:NVIDIA_API_KEY = "nvapi-your-key"
-```
-
-Or save it to the `.key` file in the project folder. **The file takes precedence:**
-if `.key` exists, `NVIDIA_API_KEY` is ignored (and the app warns you when both are
-set to different keys).
+Save your key to the `.key` file in the project folder:
 
 ```powershell
 Set-Content -NoNewline .key "nvapi-your-key"
 ```
+
+The app reads the key **only** from that file.
 
 > `.key` is listed in `.gitignore`. Never commit your key.
 
@@ -129,13 +123,12 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 |------|---------|
 | `models.json` | External model list: `state` (`ok`/`failed`/`unprobed`) and `note` (generated) |
 | `.model` | Last selector choice, used as the default next time (generated) |
-| `.key` | Optional API key, used when `NVIDIA_API_KEY` is missing |
+| `.key` | Your NVIDIA API key (the only key source; gitignored) |
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `NVIDIA_API_KEY` | — | Fallback key, used only when `.key` is missing |
 | `NVIDIA_MODEL` | — | Model to use; skips the menu |
 | `NVIDIA_MAX_TOKENS` | `2048` | Max tokens per reply (includes reasoning) |
 | `NIM_HOME` | current folder | Where to find `models.json`, `.model` and `.key` |
@@ -143,7 +136,7 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 ## How it works
 
 - `POST https://integrate.api.nvidia.com/v1/chat/completions`
-- Header `Authorization: Bearer $NVIDIA_API_KEY`
+- Header `Authorization: Bearer <key from .key>`
 - OpenAI-style JSON body (`model`, `messages`, `temperature`, `max_tokens`, `stream`)
 - **SSE streaming**: the reply is printed token by token (`data: {...}` / `data: [DONE]`)
 - Supports **reasoning models**: reads `delta.reasoning_content` separately from `delta.content`
