@@ -33,17 +33,27 @@ if (modelFlag >= 0)
     argv.RemoveRange(modelFlag, 2);
 }
 
-// --- API key: NVIDIA_API_KEY env var or .key file ---
-var apiKey = Environment.GetEnvironmentVariable("NVIDIA_API_KEY");
-if (string.IsNullOrWhiteSpace(apiKey) && File.Exists(keyPath))
+// --- API key: the .key file takes precedence; NVIDIA_API_KEY is the fallback ---
+string? fileKey = null;
+if (File.Exists(keyPath))
 {
-    try { apiKey = File.ReadAllText(keyPath).Trim(); } catch { /* reported below */ }
+    try { fileKey = File.ReadAllText(keyPath).Trim(); } catch { /* reported below */ }
 }
+
+var envKey = Environment.GetEnvironmentVariable("NVIDIA_API_KEY")?.Trim();
+var apiKey = !string.IsNullOrWhiteSpace(fileKey) ? fileKey : envKey;
+
+if (!string.IsNullOrWhiteSpace(fileKey) && !string.IsNullOrWhiteSpace(envKey) && fileKey != envKey)
+{
+    Console.Error.WriteLine("[warning] NVIDIA_API_KEY is set but .key takes precedence; using the key from .key.");
+    Console.Error.WriteLine("          Unset it with: Remove-Item Env:NVIDIA_API_KEY");
+}
+
 if (string.IsNullOrWhiteSpace(apiKey))
 {
     Console.Error.WriteLine("Missing API key.");
-    Console.Error.WriteLine(@"Set it in NVIDIA_API_KEY:  $env:NVIDIA_API_KEY = ""nvapi-your-key""");
-    Console.Error.WriteLine($@"or save it to:            {keyPath}");
+    Console.Error.WriteLine(@"Save it to .key or set NVIDIA_API_KEY:  $env:NVIDIA_API_KEY = ""nvapi-your-key""");
+    Console.Error.WriteLine($@"Key file: {keyPath}");
     return 1;
 }
 
@@ -609,7 +619,7 @@ static void PrintHelp()
           dotnet run -- --probe-all        test the whole catalog and update models.json
 
         Environment variables:
-          NVIDIA_API_KEY     your key (falls back to the .key file)
+          NVIDIA_API_KEY     fallback key, used only if .key is missing
           NVIDIA_MODEL       model to use (skips the menu)
           NVIDIA_MAX_TOKENS  max tokens per reply (default 2048)
           NIM_HOME           folder for models.json / .model / .key

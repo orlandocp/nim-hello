@@ -21,8 +21,9 @@ PowerShell (current session only):
 $env:NVIDIA_API_KEY = "nvapi-your-key"
 ```
 
-Or save it to the `.key` file in the project folder (the app falls back to it when
-the environment variable is missing):
+Or save it to the `.key` file in the project folder. **The file takes precedence:**
+if `.key` exists, `NVIDIA_API_KEY` is ignored (and the app warns you when both are
+set to different keys).
 
 ```powershell
 Set-Content -NoNewline .key "nvapi-your-key"
@@ -134,7 +135,7 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `NVIDIA_API_KEY` | — | API key (falls back to `.key`) |
+| `NVIDIA_API_KEY` | — | Fallback key, used only when `.key` is missing |
 | `NVIDIA_MODEL` | — | Model to use; skips the menu |
 | `NVIDIA_MAX_TOKENS` | `2048` | Max tokens per reply (includes reasoning) |
 | `NIM_HOME` | current folder | Where to find `models.json`, `.model` and `.key` |
