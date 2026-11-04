@@ -109,8 +109,8 @@ if (argv.Count == 1 && argv[0] is "--probe" or "-p")
         try
         {
             var probe = new NimChat(http, candidate);
-            await probe.SendAsync([new ChatMessage("user", "ping")], maxTokens: 16, ct: cts.Token);
-            Console.WriteLine($"OK      {candidate}");
+            var result = await probe.SendAsync([new ChatMessage("user", "ping")], maxTokens: 16, ct: cts.Token);
+            Console.WriteLine($"OK      {candidate}  ({DescribeReasoning(result.Reasoning)})");
         }
         catch (OperationCanceledException)
         {
@@ -129,7 +129,7 @@ if (argv.Count == 1 && argv[0] is "--probe" or "-p")
 if (argv.Count == 1 && argv[0] is "--probe-all" or "-pa")
 {
     var ids = await api.ListModelsAsync();
-    var results = new System.Collections.Concurrent.ConcurrentBag<(string Id, string Status)>();
+    var results = new System.Collections.Concurrent.ConcurrentBag<(string Id, string Status, bool Reasoning)>();
     using var gate = new SemaphoreSlim(5);
 
     await Task.WhenAll(ids.Select(async id =>
@@ -139,16 +139,16 @@ if (argv.Count == 1 && argv[0] is "--probe-all" or "-pa")
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
             var probe = new NimChat(http, id);
-            await probe.SendAsync([new ChatMessage("user", "ping")], maxTokens: 1, ct: cts.Token);
-            results.Add((id, "OK"));
+            var result = await probe.SendAsync([new ChatMessage("user", "ping")], maxTokens: 16, ct: cts.Token);
+            results.Add((id, "OK", result.Reasoning));
         }
         catch (OperationCanceledException)
         {
-            results.Add((id, "TIMEOUT"));
+            results.Add((id, "TIMEOUT", false));
         }
         catch
         {
-            results.Add((id, "FAIL"));
+            results.Add((id, "FAIL", false));
         }
         finally
         {
@@ -160,7 +160,8 @@ if (argv.Count == 1 && argv[0] is "--probe-all" or "-pa")
                  .OrderBy(r => r.Status == "OK" ? 0 : r.Status == "TIMEOUT" ? 1 : 2)
                  .ThenBy(r => r.Id, StringComparer.OrdinalIgnoreCase))
     {
-        Console.WriteLine($"{r.Status,-8} {r.Id}");
+        var reasoning = r.Status == "OK" ? $"  ({DescribeReasoning(r.Reasoning)})" : "";
+        Console.WriteLine($"{r.Status,-8} {r.Id}{reasoning}");
     }
 
     registry.ApplyProbe(results);
@@ -195,13 +196,28 @@ if (argv.Count > 0)
     try
     {
         var reply = await PrintStreamAsync(nim, history, maxTokens, showReasoning: false);
-        if (reply.Trim().Length > 0 && !registry.IsSupported(model))
+
+        var wasSupported = registry.IsSupported(model);
+        var changed = false;
+        if (reply.Text.Trim().Length > 0 && !wasSupported)
         {
-            registry.Mark(model, true);
-            registry.Save();
-            Console.Error.WriteLine($"\n[models.json] {model} responded: marked as working.");
+            registry.Mark(model, true, reasoning: reply.Reasoning);
+            changed = true;
         }
-        return reply.Trim().Length == 0 ? 2 : 0;
+        else if (registry.SetReasoning(model, reply.Reasoning))
+        {
+            changed = true;
+        }
+
+        if (changed)
+        {
+            registry.Save();
+            Console.Error.WriteLine(wasSupported
+                ? $"\n[models.json] {model} updated: {registry.DescribeReasoning(model)}."
+                : $"\n[models.json] {model} responded: marked as working ({registry.DescribeReasoning(model)}).");
+        }
+
+        return reply.Text.Trim().Length == 0 ? 2 : 0;
     }
     catch (OperationCanceledException)
     {
@@ -241,7 +257,7 @@ var chatHistory = new List<ChatMessage>();
 var showReasoning = false;
 
 Console.WriteLine();
-Console.WriteLine($"Model: {model}  (max_tokens: {maxTokens})");
+Console.WriteLine($"Model: {model}  (max_tokens: {maxTokens}, {registry.DescribeReasoning(model)})");
 Console.WriteLine("Type your message. Commands: /model (switch), /thinking, /reset, /quit.");
 Console.WriteLine();
 
@@ -295,7 +311,7 @@ while (true)
     {
         var reply = await PrintStreamAsync(chat, chatHistory, maxTokens, showReasoning);
 
-        if (reply.Trim().Length == 0)
+        if (reply.Text.Trim().Length == 0)
         {
             chatHistory.RemoveAt(chatHistory.Count - 1);
             Console.WriteLine("\n[warning] the model returned no content (did it run out of max_tokens while thinking?).");
@@ -303,14 +319,27 @@ while (true)
             continue;
         }
 
-        if (!registry.IsSupported(model))
+        var wasSupported = registry.IsSupported(model);
+        var changed = false;
+        if (!wasSupported)
         {
-            registry.Mark(model, true);
-            registry.Save();
-            Console.WriteLine($"\n[models.json] {model} responded: marked as working.");
+            registry.Mark(model, true, reasoning: reply.Reasoning);
+            changed = true;
+        }
+        else if (registry.SetReasoning(model, reply.Reasoning))
+        {
+            changed = true;
         }
 
-        chatHistory.Add(new ChatMessage("assistant", reply));
+        if (changed)
+        {
+            registry.Save();
+            Console.WriteLine(wasSupported
+                ? $"\n[models.json] {model} updated: {registry.DescribeReasoning(model)}."
+                : $"\n[models.json] {model} responded: marked as working ({registry.DescribeReasoning(model)}).");
+        }
+
+        chatHistory.Add(new ChatMessage("assistant", reply.Text));
         Console.WriteLine("\n");
     }
     catch (OperationCanceledException)
@@ -465,10 +494,10 @@ async Task<bool> EnsureSupportedAsync(string id)
     try
     {
         var probe = new NimChat(http, id);
-        await probe.SendAsync([new ChatMessage("user", "Reply with just: ok")], maxTokens: 32, ct: cts.Token);
-        registry.Mark(id, true);
+        var result = await probe.SendAsync([new ChatMessage("user", "Reply with just: ok")], maxTokens: 32, ct: cts.Token);
+        registry.Mark(id, true, reasoning: result.Reasoning);
         registry.Save();
-        Console.WriteLine("✔ responds. Saved to models.json.");
+        Console.WriteLine($"✔ responds ({registry.DescribeReasoning(id)}). Saved to models.json.");
         return true;
     }
     catch (OperationCanceledException)
@@ -497,13 +526,13 @@ async Task<bool> EnsureSupportedAsync(string id)
 }
 
 // Prints the reply live. "Thinking" is shown in gray or as (thinking...).
-static async Task<string> PrintStreamAsync(NimChat nim, IReadOnlyList<ChatMessage> history, int maxTokens, bool showReasoning)
+static async Task<(string Text, bool Reasoning)> PrintStreamAsync(NimChat nim, IReadOnlyList<ChatMessage> history, int maxTokens, bool showReasoning)
 {
     var dimmed = false;
     var thinkingShown = false;
     var contentStarted = false;
 
-    var reply = await nim.StreamAsync(
+    var result = await nim.StreamAsync(
         history,
         onContent: text =>
         {
@@ -531,7 +560,7 @@ static async Task<string> PrintStreamAsync(NimChat nim, IReadOnlyList<ChatMessag
         maxTokens: maxTokens);
 
     Console.ResetColor();
-    return reply;
+    return result;
 }
 
 static void PrintModelList(IReadOnlyList<string> ids, string header, Func<string, string> marker)
@@ -571,6 +600,8 @@ static void PrintModelList(IReadOnlyList<string> ids, string header, Func<string
     }
 
     Console.WriteLine();
+    Console.WriteLine("  R = reasoning | - = no reasoning | ? = unknown");
+    Console.WriteLine();
 }
 
 static int SafeWidth()
@@ -578,6 +609,8 @@ static int SafeWidth()
     try { return Console.WindowWidth > 0 ? Console.WindowWidth : 120; }
     catch { return 120; }
 }
+
+static string DescribeReasoning(bool reasoning) => reasoning ? "reasoning: yes" : "reasoning: no";
 
 static string? ReadSavedModel(string path)
 {
@@ -633,7 +666,7 @@ internal sealed class NimChat
     }
 
     /// <summary>Regular request (no streaming). Used to test models.</summary>
-    public async Task<string> SendAsync(
+    public async Task<(string Text, bool Reasoning)> SendAsync(
         IReadOnlyList<ChatMessage> history,
         int maxTokens = 500,
         CancellationToken ct = default)
@@ -656,11 +689,16 @@ internal sealed class NimChat
 
         using var doc = JsonDocument.Parse(body);
         var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        return GetText(message, "content");
+
+        var reasoning = GetText(message, "reasoning_content").Length > 0
+                        || GetText(message, "reasoning").Length > 0
+                        || HasReasoningTokens(doc.RootElement);
+
+        return (GetText(message, "content"), reasoning);
     }
 
     /// <summary>Streaming SSE request. Separates "thinking" (reasoning) from the reply.</summary>
-    public async Task<string> StreamAsync(
+    public async Task<(string Text, bool Reasoning)> StreamAsync(
         IReadOnlyList<ChatMessage> history,
         Action<string> onContent,
         Action<string>? onReasoning = null,
@@ -695,6 +733,7 @@ internal sealed class NimChat
         await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
         using var reader = new StreamReader(stream, Encoding.UTF8);
         var reply = new StringBuilder();
+        var sawReasoning = false;
 
         while (await reader.ReadLineAsync(timeout.Token) is { } line)
         {
@@ -714,7 +753,11 @@ internal sealed class NimChat
             // Some models (Nemotron reasoning, DeepSeek) send "thinking" separately.
             var reasoning = GetText(delta, "reasoning_content");
             if (reasoning.Length == 0) reasoning = GetText(delta, "reasoning");
-            if (reasoning.Length > 0) onReasoning?.Invoke(reasoning);
+            if (reasoning.Length > 0)
+            {
+                sawReasoning = true;
+                onReasoning?.Invoke(reasoning);
+            }
 
             var content = GetText(delta, "content");
             if (content.Length > 0)
@@ -724,7 +767,7 @@ internal sealed class NimChat
             }
         }
 
-        return reply.ToString();
+        return (reply.ToString(), sawReasoning);
     }
 
     public async Task<IReadOnlyList<string>> ListModelsAsync(CancellationToken ct = default)
@@ -747,6 +790,15 @@ internal sealed class NimChat
         => element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString() ?? ""
             : "";
+
+    /// <summary>True when usage.completion_tokens_details.reasoning_tokens is greater than zero.</summary>
+    private static bool HasReasoningTokens(JsonElement root)
+    {
+        if (!root.TryGetProperty("usage", out var usage)) return false;
+        if (!usage.TryGetProperty("completion_tokens_details", out var details)) return false;
+        if (!details.TryGetProperty("reasoning_tokens", out var tokens)) return false;
+        return tokens.ValueKind == JsonValueKind.Number && tokens.TryGetInt32(out var count) && count > 0;
+    }
 
     private string BuildHttpError(int status, string body)
     {
@@ -818,16 +870,55 @@ internal sealed class ModelRegistry
 
     public bool IsSupported(string id) => _entries.TryGetValue(id, out var entry) && entry.State == ModelState.Ok;
 
-    /// <summary>Marker for the list: ✔ works, ✘ failed, space = untested.</summary>
+    /// <summary>
+    /// Marker for the list: state (✔ works, ✘ failed, space = untested) plus
+    /// reasoning (R = reasoning, - = no reasoning, ? = unknown).
+    /// </summary>
     public string GetMarker(string id)
     {
-        if (!_entries.TryGetValue(id, out var entry)) return " ";
-        return entry.State switch
+        if (!_entries.TryGetValue(id, out var entry)) return "  ";
+
+        var state = entry.State switch
         {
             ModelState.Ok => "✔",
             ModelState.Failed => "✘",
             _ => " "
         };
+
+        var reasoning = entry.Reasoning switch
+        {
+            true => "R",
+            false => "-",
+            null => "?"
+        };
+
+        return state + reasoning;
+    }
+
+    /// <summary>Human-readable reasoning status for the model header line.</summary>
+    public string DescribeReasoning(string id)
+    {
+        if (!_entries.TryGetValue(id, out var entry)) return "reasoning: unknown";
+        return entry.Reasoning switch
+        {
+            true => "reasoning: yes",
+            false => "reasoning: no",
+            null => "reasoning: unknown"
+        };
+    }
+
+    /// <summary>Stores whether the model exposes reasoning. Returns true when the value changed.</summary>
+    public bool SetReasoning(string id, bool reasoning)
+    {
+        if (!_entries.TryGetValue(id, out var entry))
+        {
+            entry = new ModelEntry { Id = id };
+            _entries[id] = entry;
+        }
+
+        if (entry.Reasoning == reasoning) return false;
+        entry.Reasoning = reasoning;
+        return true;
     }
 
     /// <summary>Adds any missing official catalog ids as "unprobed".</summary>
@@ -843,7 +934,7 @@ internal sealed class ModelRegistry
         return added;
     }
 
-    public void Mark(string id, bool supported, string? note = null)
+    public void Mark(string id, bool supported, string? note = null, bool? reasoning = null)
     {
         if (!_entries.TryGetValue(id, out var entry))
         {
@@ -853,11 +944,12 @@ internal sealed class ModelRegistry
 
         entry.State = supported ? ModelState.Ok : ModelState.Failed;
         entry.Note = supported ? null : note;
+        if (reasoning.HasValue) entry.Reasoning = reasoning;
     }
 
-    public void ApplyProbe(IEnumerable<(string Id, string Status)> results)
+    public void ApplyProbe(IEnumerable<(string Id, string Status, bool Reasoning)> results)
     {
-        foreach (var (id, status) in results)
+        foreach (var (id, status, reasoning) in results)
         {
             if (!_entries.TryGetValue(id, out var entry))
             {
@@ -867,7 +959,13 @@ internal sealed class ModelRegistry
 
             entry.State = status == "OK" ? ModelState.Ok : ModelState.Failed;
             if (status != "OK")
+            {
                 entry.Note = status == "TIMEOUT" ? "timeout" : "no response";
+            }
+            else
+            {
+                entry.Reasoning = reasoning;
+            }
         }
     }
 
@@ -914,6 +1012,10 @@ internal sealed class ModelEntry
 {
     public string Id { get; set; } = "";
     public string State { get; set; } = ModelState.Unprobed;
+
+    /// <summary>True = the model emits reasoning, false = it does not, null = not observed yet.</summary>
+    public bool? Reasoning { get; set; }
+
     public string? Note { get; set; }
 }
 

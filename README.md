@@ -37,18 +37,24 @@ you pick one:
 
 ```
 Models that work with your account (14):
-   1. ✔ google/diffusiongemma-26b-a4b-it                 8. ✔ nvidia/nemotron-3-ultra-550b-a55b
-   2. ✔ meta/llama-3.2-90b-vision-instruct               9. ✔ nvidia/nemotron-3.5-bolt-e4b
-   3. ✔ meta/llama-guard-4-12b                          10. ✔ nvidia/nemotron-3.5-lightning-30b-a3b
-   4. ✔ meta/muse-glimmer-30b                           11. ✔ nvidia/nemotron-3.5-super-vl-120b-a12b
-   5. ✔ minimaxai/minimax-m3.1-flash                    12. ✔ nvidia/nemotron-parse-2.0
-   6. ✔ mistralai/mistral-large-4-1t-a52b               13. ✔ nvidia/riva-translate-4b-instruct-v2
-   7. ✔ nvidia/nemotron-3-nano-omni-30b-a3b-reasoning   14. ✔ poolside/laguna-xs-2.1
+   1. ✔- google/diffusiongemma-26b-a4b-it                 8. ✔R nvidia/nemotron-3-ultra-550b-a55b
+   2. ✔? meta/llama-3.2-90b-vision-instruct               9. ✔- nvidia/nemotron-3.5-bolt-e4b
+   3. ✔- meta/llama-guard-4-12b                          10. ✔R nvidia/nemotron-3.5-lightning-30b-a3b
+   4. ✔R meta/muse-glimmer-30b                           11. ✔R nvidia/nemotron-3.5-super-vl-120b-a12b
+   5. ✔R minimaxai/minimax-m3.1-flash                    12. ✔- nvidia/nemotron-parse-2.0
+   6. ✔R mistralai/mistral-large-4-1t-a52b               13. ✔- nvidia/riva-translate-4b-instruct-v2
+   7. ✔R nvidia/nemotron-3-nano-omni-30b-a3b-reasoning   14. ✔- poolside/laguna-xs-2.1
 
+  R = reasoning | - = no reasoning | ? = unknown
   Enter = minimaxai/minimax-m3.1-flash
   number = select · all = full catalog (85) · text = search · q = quit
 model>
 ```
+
+The marker has two parts: the state (`✔` works, `✘` failed, blank = untested)
+and the reasoning flag (`R` = the model emits reasoning, `-` = it does not,
+`?` = not observed yet). Reasoning models are the ones that show
+`(thinking...)` and spend `max_tokens` on hidden reasoning.
 
 | Input | Effect |
 |-------|--------|
@@ -74,7 +80,7 @@ On every interactive start the app calls `GET /v1/models` and **adds any missing
 ids to `models.json`** with state `unprobed`. That way the file reflects the
 official list even before you know whether your account can use those models.
 
-Each entry has a single state field:
+Each entry has a state field plus the observed reasoning flag:
 
 | `state` | Meaning |
 |---------|---------|
@@ -86,7 +92,12 @@ Each entry has a single state field:
 |-------|---------|
 | `id` | Model id |
 | `state` | `ok` / `failed` / `unprobed` |
+| `reasoning` | `true` = emits reasoning, `false` = does not, absent = not observed yet |
 | `note` | Optional detail from the last result (`timeout`, `HTTP 404`, etc.) |
+
+The app learns `reasoning` automatically: after any successful reply it checks
+for `reasoning_content` / `reasoning` in the response (or
+`usage.completion_tokens_details.reasoning_tokens > 0`) and stores the result.
 
 The file never removes old entries: if NVIDIA drops a model from the catalog it
 stays there as a reference until you delete it by hand.
@@ -121,7 +132,7 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 
 | File | Purpose |
 |------|---------|
-| `models.json` | External model list: `state` (`ok`/`failed`/`unprobed`) and `note` (generated) |
+| `models.json` | External model list: `state` (`ok`/`failed`/`unprobed`), `reasoning` and `note` (generated) |
 | `.model` | Last selector choice, used as the default next time (generated) |
 | `.key` | Your NVIDIA API key (the only key source; gitignored) |
 
