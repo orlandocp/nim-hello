@@ -36,71 +36,120 @@ On startup it shows the models that already responded with your account and lets
 you pick one:
 
 ```
-Models that work with your account (14):
-   1. ✔- google/diffusiongemma-26b-a4b-it                 8. ✔R nvidia/nemotron-3-ultra-550b-a55b
-   2. ✔? meta/llama-3.2-90b-vision-instruct               9. ✔- nvidia/nemotron-3.5-bolt-e4b
-   3. ✔- meta/llama-guard-4-12b                          10. ✔R nvidia/nemotron-3.5-lightning-30b-a3b
-   4. ✔R meta/muse-glimmer-30b                           11. ✔R nvidia/nemotron-3.5-super-vl-120b-a12b
-   5. ✔R minimaxai/minimax-m3.1-flash                    12. ✔- nvidia/nemotron-parse-2.0
-   6. ✔R mistralai/mistral-large-4-1t-a52b               13. ✔- nvidia/riva-translate-4b-instruct-v2
-   7. ✔R nvidia/nemotron-3-nano-omni-30b-a3b-reasoning   14. ✔- poolside/laguna-xs-2.1
+Models that work with your account (13 of 83) - 2 stale (revalidated when selected):
+  22. ✓ NR  10d* meta/llama-3.2-90b-vision-instruct
+  25. ✓ R    1d  meta/muse-glimmer-30b
+  29. ✓ R   12h  minimaxai/minimax-m3.1-flash
+  ...
+  61. ✓ R   30d* nvidia/nemotron-3.5-lightning-30b-a3b
 
-  R = reasoning | - = no reasoning | ? = unknown
-  Enter = minimaxai/minimax-m3.1-flash
-  number = select · all = full catalog (85) · text = search · q = quit
+  ? = untested | ✓ = works | ✗ = not enabled | ! = error | ∅ = not in catalog
+  R = reasoning | NR = no reasoning | - = unknown
+  age = time since the last probe | * = stale, revalidated when selected
+  number = position in the full catalog (1-83)
+
+  Current: meta/muse-glimmer-30b  (✓R, last probe 1d ago)
+  number = select · text = search · Enter = meta/muse-glimmer-30b · q = quit
+  /all full (83) · /works only ✓ · /probe test all · /retry ! only (10) · /help
 model>
 ```
 
-The marker has two parts: the state (`✔` works, `✘` failed, blank = untested)
-and the reasoning flag (`R` = the model emits reasoning, `-` = it does not,
-`?` = not observed yet). Reasoning models are the ones that show
-`(thinking...)` and spend `max_tokens` on hidden reasoning.
+Each row has four parts:
+
+- **Number**: the position in the **full catalog**, the same number the model
+  has in the `/all` view. Typing `25` picks the same model in every view; a
+  filtered list shows gaps because it is a subset.
+- **State**: `?` never tested, `✓` responds with your account, `✗` rejected
+  (400/403/404/410), `!` transient error (timeout, 429, 5xx, network), `∅` no
+  longer in the official catalog.
+- **Reasoning**: `R` emits reasoning, `NR` does not, `-` not observed yet.
+  Reasoning models show `(thinking...)` and spend `max_tokens` on hidden
+  reasoning.
+- **Age**: time since the last probe (`5m`, `3h`, `9d`), plus `*` when the result
+  is stale and will be revalidated on selection.
+
+On a fresh install every entry shows `?` and the selector opens the full catalog;
+pick one and the app probes it before chatting.
 
 | Input | Effect |
 |-------|--------|
 | `Enter` | Use the default model (last choice, or `minimaxai/minimax-m3.1-flash`) |
-| `5` | Pick model number 5 from the displayed list |
-| `all` | Show the full catalog (85) in two columns: `✔` works, `✘` failed, blank = untested |
+| `25` | Pick the model at position 25 of the full catalog |
 | `nemotron` | Search by text; a single match is selected, several matches are numbered |
-| `q` | Quit without chatting |
+| `/all` | Show the full catalog with every state |
+| `/works` | Go back to the list of models marked `✓` |
+| `/probe` | Test every model in the catalog (asks `y/N` first; skips `∅`) |
+| `/retry` | Test only the models marked `!` (no confirmation) |
+| `/help` | List the selector commands |
+| `/quit` or `q` | Quit without chatting |
 
-If you pick a model **without ✔**, the app sends it a test question with a
-**30-second timeout**:
+Anything that starts with `/` is a command; anything else is a number, an exact
+model id or a text search. That way `all`, `probe` or `works` can still be used
+as search terms.
 
-- It responds → marked as `ok` and saved to `models.json`.
-- No response (timeout) or 400/403/404 → saved as `failed` and you are back at the menu.
+`/probe` and `/retry` print one line per model as it finishes, then a summary with
+the elapsed time, and redraw the same view; they do not enter the chat.
+
+```
+ERROR   nvidia/llama-3.1-nemoguard-8b-content-safety  (HTTP 415)   [2/10]
+OK      nvidia/nemotron-parse-2.0  (reasoning: no)   [6/10]
+...
+OK: 1   DENIED: 0   ERROR: 9   TOTAL: 10   in 2m 4s
+```
+
+If the chosen model is **untested or stale**, the app probes it before entering
+the chat. The probe streams a tiny request and stops at the first token (content
+or reasoning), so it measures reachability, not answer quality:
+
+- Any token arrives → `ok`; the chat starts.
+- 400/403/404/410 → `denied`; the reason is shown and you stay in the same list.
+- Timeout, 429, 5xx or network error → `error`, with one retry for transient
+  failures. The reason is shown and you stay in the same list.
+- 401/402 → the probe is aborted and nothing is marked (bad key or no credit).
+
+A model is probed again only when its last result is stale:
+
+| Last state | Revalidated after |
+|------------|-------------------|
+| `ok` | 7 days |
+| `error` | 60 minutes |
+| `denied` | 30 days |
+| `unprobed` | always |
 
 The same happens if an untested model eventually responds in chat: it is marked
-automatically. The list lives in **`models.json`** (not hardcoded) and can be
-regenerated with `--probe-all`.
+automatically. The list lives in **`models.json`** (not hardcoded). `--probe-all`
+is optional: it only seeds many results at once.
 
 ### Sync with the official catalog
 
 On every interactive start the app calls `GET /v1/models` and **adds any missing
-ids to `models.json`** with state `unprobed`. That way the file reflects the
-official list even before you know whether your account can use those models.
-
-Each entry has a state field plus the observed reasoning flag:
+ids to `models.json`** with state `unprobed`. Ids that disappear from a
+successful catalog response are marked `inCatalog: false` (`∅`) instead of being
+deleted, so their history and notes are kept. The flags are not touched when the
+catalog request fails or returns an implausibly short list.
 
 | `state` | Meaning |
 |---------|---------|
 | `ok` | Tested and **responds** with your account |
-| `failed` | Tested and **does not respond** (timeout, 404…) |
+| `denied` | Tested and **rejected** (400/403/404/410) |
+| `error` | Probe failed for a transient reason (timeout, 429, 5xx, network) |
 | `unprobed` | In the official catalog, **never tested** |
 
 | Field | Meaning |
 |-------|---------|
 | `id` | Model id |
-| `state` | `ok` / `failed` / `unprobed` |
+| `state` | `ok` / `denied` / `error` / `unprobed` |
 | `reasoning` | `true` = emits reasoning, `false` = does not, absent = not observed yet |
-| `note` | Optional detail from the last result (`timeout`, `HTTP 404`, etc.) |
+| `note` | Human note; the app never overwrites it |
+| `lastError` | Detail of the last failure (`timeout`, `HTTP 404`, `no content`) |
+| `lastProbe` | When the model was last probed or used successfully |
+| `inCatalog` | `false` when the id left the official catalog |
 
-The app learns `reasoning` automatically: after any successful reply it checks
-for `reasoning_content` / `reasoning` in the response (or
-`usage.completion_tokens_details.reasoning_tokens > 0`) and stores the result.
+The app learns `reasoning` automatically from the first streamed chunk after a
+successful reply and stores the result.
 
-The file never removes old entries: if NVIDIA drops a model from the catalog it
-stays there as a reference until you delete it by hand.
+`models.json` is schema version 2. An older or unreadable file is copied to
+`models.json.bak` and ignored; it is not migrated.
 
 `models.json`, `.model` and `.key` are gitignored: they are local state, not source.
 
@@ -108,10 +157,27 @@ stays there as a reference until you delete it by hand.
 
 | Command | Effect |
 |---------|--------|
-| `/model` | Open the model selector again (clears the history when switching) |
+| `/model` | Open the model selector; the conversation is kept |
+| `/model <id or text>` | Switch directly (exact id, or a unique part of it) |
 | `/thinking` | Show/hide the model's reasoning (in gray) |
 | `/reset` | Clear the conversation history |
 | `/quit` | Exit (also `/exit`) |
+
+Switching keeps the whole conversation: the API is stateless, so the next request
+sends the full history to the new model.
+
+```
+you> My name is Orlando. Reply with just OK.
+bot> OK
+you> /model meta/llama-3.2-90b-vision-instruct
+(model: meta/llama-3.2-90b-vision-instruct · 2 messages kept)
+you> What is my name? Answer with one word.
+bot> Orlando
+```
+
+If the new model has a smaller context window and rejects the history, the app
+drops the oldest half, tells you how many messages it removed, and retries the
+same message once. `/reset` clears everything by hand.
 
 ## One-shot mode
 
@@ -132,7 +198,7 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 
 | File | Purpose |
 |------|---------|
-| `models.json` | External model list: `state` (`ok`/`failed`/`unprobed`), `reasoning` and `note` (generated) |
+| `models.json` | External model list: `state`, `reasoning`, `lastProbe`, `lastError`, `inCatalog` (generated) |
 | `.model` | Last selector choice, used as the default next time (generated) |
 | `.key` | Your NVIDIA API key (the only key source; gitignored) |
 
@@ -143,6 +209,11 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 | `NVIDIA_MODEL` | — | Model to use; skips the menu |
 | `NVIDIA_MAX_TOKENS` | `2048` | Max tokens per reply (includes reasoning) |
 | `NIM_HOME` | current folder | Where to find `models.json`, `.model` and `.key` |
+| `NVIDIA_PROBE_TIMEOUT` | `30` | Seconds per probe attempt |
+| `NVIDIA_PROBE_RETRIES` | `1` | Retries for transient probe failures (timeout, 429, 5xx, network) |
+| `NVIDIA_REPROBE_OK_DAYS` | `7` | Revalidate working models after N days |
+| `NVIDIA_REPROBE_ERROR_MINUTES` | `60` | Retry errored models after N minutes |
+| `NVIDIA_REPROBE_DENIED_DAYS` | `30` | Retry denied models after N days |
 
 ## How it works
 
@@ -156,15 +227,20 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 ## Model diagnostics
 
 ```powershell
-dotnet run -- --models     # list the 85 catalog ids (and sync models.json)
-dotnet run -- --probe      # test 5 models with a 15s timeout
-dotnet run -- --probe-all  # test the whole catalog and update models.json
+dotnet run -- --models     # list the catalog ids (and sync models.json)
+dotnet run -- --probe      # test 5 models and save the results
+dotnet run -- --probe-all  # test the whole catalog, 3 at a time, and update models.json
 ```
 
-**Important:** `GET /v1/models` returns the **catalog** (85 models), not what your
-account is allowed to use. The only way to know what is enabled is to test with
-your key. Free accounts usually have only a subset enabled; run `--probe-all`
-to find yours.
+`--probe` and `--probe-all` print `OK`, `DENIED` or `ERROR` per model and update
+`models.json` (unlike the interactive probe, `--probe-all` does not retry
+transient failures). A 401 or 402 aborts the run instead of marking every model.
+
+**Important:** `GET /v1/models` returns the **catalog** (84 models at the time of
+writing), not what your account is allowed to use. The only way to know what is
+enabled is to test with your key. You do **not** need `--probe-all` to start:
+pick any model in the selector and it is probed on demand. `--probe-all` is just
+a bulk shortcut for testing the whole catalog at once.
 
 ## Common errors
 
@@ -173,8 +249,9 @@ to find yours.
 | 401 / 403 | Invalid or expired key, or no permission for that model |
 | 402 | No credit on the account |
 | 404 | The `model` is not enabled for your account |
+| 410 | The model was retired or removed from the catalog |
 | 429 | Rate limit: wait and retry |
 
-If a model **does not respond** (it just hangs), it is not enabled for the account:
-the gateway does not answer and the client has to cut it off with a timeout. Use
-another model or `--probe-all`.
+If a model **does not respond**, it is recorded as `!` (timeout), not `✗`: the
+result is inconclusive, not proof that the account lacks access. Retry later or
+pick it again from the selector.

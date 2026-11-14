@@ -7,7 +7,11 @@ using System.Text.Json.Serialization;
 try { Console.OutputEncoding = Encoding.UTF8; } catch { /* redirected console */ }
 
 const string DefaultModel = "minimaxai/minimax-m3.1-flash";
-const int VerifyTimeoutSeconds = 30;
+const int DefaultProbeTimeoutSeconds = 30;
+const int DefaultProbeRetries = 1;
+const int DefaultOkDays = 7;
+const int DefaultErrorMinutes = 60;
+const int DefaultDeniedDays = 30;
 
 // Folder where models.json, .model and .key live (current directory by default).
 var nimHome = Environment.GetEnvironmentVariable("NIM_HOME");
@@ -17,6 +21,13 @@ nimHome = Path.GetFullPath(nimHome);
 var modelsPath = Path.Combine(nimHome, "models.json");
 var lastModelPath = Path.Combine(nimHome, ".model");
 var keyPath = Path.Combine(nimHome, ".key");
+
+// Probe and revalidation settings.
+var probeTimeoutSeconds = ReadIntEnv("NVIDIA_PROBE_TIMEOUT", DefaultProbeTimeoutSeconds, 1);
+var probeRetries = ReadIntEnv("NVIDIA_PROBE_RETRIES", DefaultProbeRetries, 0);
+var okTtl = TimeSpan.FromDays(ReadIntEnv("NVIDIA_REPROBE_OK_DAYS", DefaultOkDays, 0));
+var errorTtl = TimeSpan.FromMinutes(ReadIntEnv("NVIDIA_REPROBE_ERROR_MINUTES", DefaultErrorMinutes, 0));
+var deniedTtl = TimeSpan.FromDays(ReadIntEnv("NVIDIA_REPROBE_DENIED_DAYS", DefaultDeniedDays, 0));
 
 // --- Arguments: --model <id> can be combined with a question ---
 var argv = args.ToList();
@@ -48,9 +59,7 @@ if (string.IsNullOrWhiteSpace(apiKey))
 }
 
 // Max tokens per reply (includes the "thinking" of reasoning models).
-var maxTokens = int.TryParse(Environment.GetEnvironmentVariable("NVIDIA_MAX_TOKENS"), out var mt) && mt > 0
-    ? mt
-    : 2048;
+var maxTokens = ReadIntEnv("NVIDIA_MAX_TOKENS", 2048, 1);
 
 using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
 http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
@@ -76,11 +85,13 @@ if (argv.Count == 1 && argv[0] is "--models" or "-m")
             Console.WriteLine(id);
 
         // Keep models.json in sync with the official catalog.
-        var added = registry.SyncCatalog(ids);
-        if (added > 0)
+        var (added, changed) = registry.SyncCatalog(ids);
+        if (changed)
         {
             registry.Save();
-            Console.Error.WriteLine($"[models.json] +{added} new models from the catalog (not tested).");
+            Console.Error.WriteLine(added > 0
+                ? $"[models.json] +{added} new models from the catalog."
+                : "[models.json] catalog membership updated.");
         }
 
         return 0;
@@ -105,74 +116,57 @@ if (argv.Count == 1 && argv[0] is "--probe" or "-p")
 
     foreach (var candidate in candidates)
     {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        try
+        var result = await ProbeModelAsync(new NimChat(http, candidate), probeTimeoutSeconds, probeRetries);
+        if (result.Outcome == ProbeOutcome.Fatal)
         {
-            var probe = new NimChat(http, candidate);
-            var result = await probe.SendAsync([new ChatMessage("user", "ping")], maxTokens: 16, ct: cts.Token);
-            Console.WriteLine($"OK      {candidate}  ({DescribeReasoning(result.Reasoning)})");
+            Console.WriteLine($"ABORT   {candidate}  ->  {result.Detail}");
+            Console.WriteLine("Check the API key or account credit, then retry.");
+            registry.Save();
+            return 1;
         }
-        catch (OperationCanceledException)
+
+        registry.ApplyProbe(candidate, result);
+
+        var label = result.Outcome switch
         {
-            Console.WriteLine($"TIMEOUT {candidate}  (no response within 15s)");
-        }
-        catch (Exception ex)
-        {
-            var detail = ex.Message.Split('\n')[0];
-            Console.WriteLine($"FAIL    {candidate}  ->  {detail}");
-        }
+            ProbeOutcome.Responded => "OK",
+            ProbeOutcome.Denied => "DENIED",
+            _ => "ERROR"
+        };
+        var detail = result.Outcome == ProbeOutcome.Responded
+            ? $"({registry.DescribeReasoning(candidate)})"
+            : $"({result.Detail})";
+        Console.WriteLine($"{label,-7} {candidate}  {detail}");
     }
 
+    registry.Save();
     return 0;
 }
 
 if (argv.Count == 1 && argv[0] is "--probe-all" or "-pa")
 {
-    var ids = await api.ListModelsAsync();
-    var results = new System.Collections.Concurrent.ConcurrentBag<(string Id, string Status, bool Reasoning)>();
-    using var gate = new SemaphoreSlim(5);
-
-    await Task.WhenAll(ids.Select(async id =>
+    List<string> ids;
+    try
     {
-        await gate.WaitAsync();
-        try
-        {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
-            var probe = new NimChat(http, id);
-            var result = await probe.SendAsync([new ChatMessage("user", "ping")], maxTokens: 16, ct: cts.Token);
-            results.Add((id, "OK", result.Reasoning));
-        }
-        catch (OperationCanceledException)
-        {
-            results.Add((id, "TIMEOUT", false));
-        }
-        catch
-        {
-            results.Add((id, "FAIL", false));
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }));
-
-    foreach (var r in results
-                 .OrderBy(r => r.Status == "OK" ? 0 : r.Status == "TIMEOUT" ? 1 : 2)
-                 .ThenBy(r => r.Id, StringComparer.OrdinalIgnoreCase))
+        ids = (await api.ListModelsAsync()).ToList();
+    }
+    catch (Exception ex)
     {
-        var reasoning = r.Status == "OK" ? $"  ({DescribeReasoning(r.Reasoning)})" : "";
-        Console.WriteLine($"{r.Status,-8} {r.Id}{reasoning}");
+        Console.Error.WriteLine($"[error] {ex.Message}");
+        return 1;
     }
 
-    registry.ApplyProbe(results);
+    var batch = await ProbeBatchAsync(ids, retries: 0);
     registry.Save();
+    PrintBatchSummary(batch);
+    Console.WriteLine($"models.json updated: {registry.SupportedIds.Count(id => registry.IsInCatalog(id))} supported.");
 
-    Console.WriteLine();
-    Console.WriteLine($"OK: {results.Count(r => r.Status == "OK")}   " +
-                      $"TIMEOUT: {results.Count(r => r.Status == "TIMEOUT")}   " +
-                      $"FAIL: {results.Count(r => r.Status == "FAIL")}   " +
-                      $"TOTAL: {results.Count}");
-    Console.WriteLine($"models.json updated: {registry.SupportedIds.Count} supported.");
+    if (batch.Fatal is not null)
+    {
+        Console.Error.WriteLine($"[aborted] {batch.Fatal}. Check the API key or account credit.");
+        return 1;
+    }
+
     return 0;
 }
 
@@ -197,24 +191,12 @@ if (argv.Count > 0)
     {
         var reply = await PrintStreamAsync(nim, history, maxTokens, showReasoning: false);
 
-        var wasSupported = registry.IsSupported(model);
-        var changed = false;
-        if (reply.Text.Trim().Length > 0 && !wasSupported)
+        if (reply.Text.Trim().Length > 0)
         {
-            registry.Mark(model, true, reasoning: reply.Reasoning);
-            changed = true;
-        }
-        else if (registry.SetReasoning(model, reply.Reasoning))
-        {
-            changed = true;
-        }
-
-        if (changed)
-        {
+            var changed = registry.MarkChatSuccess(model, reply.Reasoning);
             registry.Save();
-            Console.Error.WriteLine(wasSupported
-                ? $"\n[models.json] {model} updated: {registry.DescribeReasoning(model)}."
-                : $"\n[models.json] {model} responded: marked as working ({registry.DescribeReasoning(model)}).");
+            if (changed)
+                Console.Error.WriteLine($"\n[models.json] {model}: {registry.DescribeReasoning(model)}.");
         }
 
         return reply.Text.Trim().Length == 0 ? 2 : 0;
@@ -223,12 +205,17 @@ if (argv.Count > 0)
     {
         Console.ResetColor();
         Console.Error.WriteLine("\n[timeout] the model did not respond within 120s.");
+        registry.MarkChatError(model, ModelState.Error, "timeout 120s");
+        registry.Save();
         return 1;
     }
     catch (Exception ex)
     {
         Console.ResetColor();
         Console.Error.WriteLine($"\n[error] {ex.Message}");
+        var (state, detail) = ClassifyChatError(ex);
+        registry.MarkChatError(model, state, detail);
+        registry.Save();
         return 1;
     }
 }
@@ -256,9 +243,11 @@ var chat = new NimChat(http, model);
 var chatHistory = new List<ChatMessage>();
 var showReasoning = false;
 
+var ageText = registry.GetAge(model);
 Console.WriteLine();
-Console.WriteLine($"Model: {model}  (max_tokens: {maxTokens}, {registry.DescribeReasoning(model)})");
-Console.WriteLine("Type your message. Commands: /model (switch), /thinking, /reset, /quit.");
+Console.WriteLine($"Model: {model}  (max_tokens: {maxTokens}, {registry.DescribeReasoning(model)}, " +
+                  $"{(ageText == "n/a" ? "not probed" : $"last probe {ageText} ago")})");
+Console.WriteLine("Type your message. Commands: /model [id] (switch, keeps the conversation), /thinking, /reset, /quit.");
 Console.WriteLine();
 
 while (true)
@@ -288,71 +277,101 @@ while (true)
         continue;
     }
 
-    if (line == "/model")
+    var isModelCommand = line.StartsWith("/model", StringComparison.OrdinalIgnoreCase)
+                         && (line.Length == "/model".Length || char.IsWhiteSpace(line["/model".Length]));
+
+    if (isModelCommand)
     {
-        var picked = await SelectModelAsync(model);
-        if (picked is null)
+        var arg = line["/model".Length..].Trim();
+        string? picked;
+
+        if (arg.Length == 0)
         {
-            Console.WriteLine("(unchanged)\n");
-            continue;
+            picked = await SelectModelAsync(model);
+            if (picked is null)
+            {
+                Console.WriteLine("(unchanged)\n");
+                continue;
+            }
         }
+        else
+        {
+            picked = await ResolveModelAsync(arg);
+            if (picked is null)
+            {
+                Console.WriteLine();
+                continue;
+            }
+            if (!await TrySelectAsync(picked)) continue;
+        }
+
+        // The conversation is kept: the next request sends the whole history to
+        // the new model (the API is stateless).
         model = picked;
         chat = new NimChat(http, model);
-        chatHistory.Clear();
         SaveLastModel(lastModelPath, model);
-        Console.WriteLine($"(model: {model}; history cleared)\n");
+        Console.WriteLine($"(model: {model} · {chatHistory.Count} messages kept)\n");
         continue;
     }
 
-    chatHistory.Add(new ChatMessage("user", line));
-    Console.Write("bot> ");
-
-    try
+    var trims = 0;
+    while (true)
     {
-        var reply = await PrintStreamAsync(chat, chatHistory, maxTokens, showReasoning);
+        chatHistory.Add(new ChatMessage("user", line));
+        Console.Write("bot> ");
 
-        if (reply.Text.Trim().Length == 0)
+        try
         {
-            chatHistory.RemoveAt(chatHistory.Count - 1);
-            Console.WriteLine("\n[warning] the model returned no content (did it run out of max_tokens while thinking?).");
-            Console.WriteLine($"          Try: $env:NVIDIA_MAX_TOKENS = \"{maxTokens * 2}\" and restart.\n");
-            continue;
-        }
+            var reply = await PrintStreamAsync(chat, chatHistory, maxTokens, showReasoning);
 
-        var wasSupported = registry.IsSupported(model);
-        var changed = false;
-        if (!wasSupported)
-        {
-            registry.Mark(model, true, reasoning: reply.Reasoning);
-            changed = true;
-        }
-        else if (registry.SetReasoning(model, reply.Reasoning))
-        {
-            changed = true;
-        }
+            if (reply.Text.Trim().Length == 0)
+            {
+                chatHistory.RemoveAt(chatHistory.Count - 1);
+                Console.WriteLine("\n[warning] the model returned no content (did it run out of max_tokens while thinking?).");
+                Console.WriteLine($"          Try: $env:NVIDIA_MAX_TOKENS = \"{maxTokens * 2}\" and restart.\n");
+                break;
+            }
 
-        if (changed)
-        {
+            var changed = registry.MarkChatSuccess(model, reply.Reasoning);
             registry.Save();
-            Console.WriteLine(wasSupported
-                ? $"\n[models.json] {model} updated: {registry.DescribeReasoning(model)}."
-                : $"\n[models.json] {model} responded: marked as working ({registry.DescribeReasoning(model)}).");
-        }
 
-        chatHistory.Add(new ChatMessage("assistant", reply.Text));
-        Console.WriteLine("\n");
-    }
-    catch (OperationCanceledException)
-    {
-        Console.ResetColor();
-        chatHistory.RemoveAt(chatHistory.Count - 1);
-        Console.Error.WriteLine("\n[timeout] the model did not respond within 120s. Try again or use /model.\n");
-    }
-    catch (Exception ex)
-    {
-        Console.ResetColor();
-        chatHistory.RemoveAt(chatHistory.Count - 1);
-        Console.Error.WriteLine($"\n[error] {ex.Message}\n");
+            if (changed)
+                Console.WriteLine($"\n[models.json] {model}: {registry.DescribeReasoning(model)}.");
+
+            chatHistory.Add(new ChatMessage("assistant", reply.Text));
+            Console.WriteLine("\n");
+            break;
+        }
+        catch (Exception ex) when (IsContextOverflow(ex) && trims < 2 && chatHistory.Count > 2)
+        {
+            // The model's context window is smaller than the history: drop the
+            // oldest turns and send the same message again.
+            trims++;
+            Console.ResetColor();
+            chatHistory.RemoveAt(chatHistory.Count - 1);
+            var dropped = TrimHistory(chatHistory);
+            Console.Error.WriteLine($"\n[context] {model} rejected the history as too long. " +
+                                    $"Dropped {dropped} older messages, retrying...\n");
+        }
+        catch (OperationCanceledException)
+        {
+            Console.ResetColor();
+            chatHistory.RemoveAt(chatHistory.Count - 1);
+            registry.MarkChatError(model, ModelState.Error, "timeout 120s");
+            registry.Save();
+            Console.Error.WriteLine("\n[timeout] the model did not respond within 120s. Try again or use /model.\n");
+            break;
+        }
+        catch (Exception ex)
+        {
+            Console.ResetColor();
+            chatHistory.RemoveAt(chatHistory.Count - 1);
+            var (state, detail) = ClassifyChatError(ex);
+            registry.MarkChatError(model, state, detail);
+            registry.Save();
+            Console.Error.WriteLine($"\n[error] {ex.Message}\n");
+            break;
+        }
     }
 }
 
@@ -366,11 +385,13 @@ async Task<List<string>> GetCatalogAsync()
     try
     {
         catalogCache = (await api.ListModelsAsync()).ToList();
-        var added = registry.SyncCatalog(catalogCache);
-        if (added > 0)
+        var (added, changed) = registry.SyncCatalog(catalogCache);
+        if (changed)
         {
             registry.Save();
-            Console.WriteLine($"(models.json: +{added} new models from the official catalog, not tested yet)");
+            Console.WriteLine(added > 0
+                ? $"(models.json: +{added} new models from the official catalog)"
+                : "(models.json: catalog membership updated)");
         }
     }
     catch (Exception ex)
@@ -382,8 +403,30 @@ async Task<List<string>> GetCatalogAsync()
     return catalogCache;
 }
 
+// Resolves "/model <text>" to a model id: exact match first, then a unique
+// substring match.
+async Task<string?> ResolveModelAsync(string arg)
+{
+    var catalog = await GetCatalogAsync();
+    var all = catalog.Concat(registry.Ids)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    var exact = all.FirstOrDefault(id => id.Equals(arg, StringComparison.OrdinalIgnoreCase));
+    if (exact is not null) return exact;
+
+    var matches = all.Where(id => id.Contains(arg, StringComparison.OrdinalIgnoreCase)).ToList();
+    if (matches.Count == 1) return matches[0];
+
+    Console.WriteLine(matches.Count == 0
+        ? $"  No model matches \"{arg}\"."
+        : $"  \"{arg}\" matches {matches.Count} models. Use /model to pick one from the list.");
+    return null;
+}
+
 // --- Model selector ---
-async Task<string?> SelectModelAsync(string menuDefault)
+async Task<string?> SelectModelAsync(string current)
 {
     var catalog = await GetCatalogAsync();
 
@@ -391,6 +434,12 @@ async Task<string?> SelectModelAsync(string menuDefault)
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
         .ToList();
+
+    if (all.Count == 0)
+    {
+        Console.Error.WriteLine("[error] no models available: the catalog is unreachable and models.json is empty.");
+        return null;
+    }
 
     var mode = "supported";
     var search = "";
@@ -403,77 +452,162 @@ async Task<string?> SelectModelAsync(string menuDefault)
         if (mode == "all")
         {
             shown = all;
-            header = $"Full catalog ({all.Count}) — ✔ works | ✘ failed | blank = untested";
+            header = $"Full catalog ({all.Count})";
         }
         else if (mode == "search")
         {
             shown = all.Where(id => id.Contains(search, StringComparison.OrdinalIgnoreCase)).ToList();
-            header = $"Results for \"{search}\" ({shown.Count})";
+            header = $"Results for \"{search}\" ({shown.Count} of {all.Count})";
         }
         else
         {
-            shown = registry.SupportedIds.ToList();
+            shown = registry.Ids
+                .Where(registry.IsSupported)
+                .ToList();
+
             if (shown.Count == 0)
             {
                 shown = all;
-                header = $"No tested models yet — full catalog ({all.Count})";
+                header = $"No usable tested models - full catalog ({all.Count})";
             }
             else
             {
-                header = $"Models that work with your account ({shown.Count})";
+                header = $"Models that work with your account ({shown.Count} of {all.Count})";
             }
         }
 
-        PrintModelList(shown, header, registry.GetMarker);
-        Console.WriteLine($"  Enter = {menuDefault}");
-        Console.WriteLine($"  number = select · all = full catalog ({all.Count}) · text = search · q = quit");
+        var stale = shown.Count(id => registry.IsStale(id, okTtl, errorTtl, deniedTtl));
+        if (stale > 0) header += $" - {stale} stale (revalidated when selected)";
+
+        PrintModelList(shown, header, registry, okTtl, errorTtl, deniedTtl, showAge: mode != "all", all);
+
+        var currentMarker = registry.GetMarker(current).Replace(" ", "");
+        var currentAge = registry.GetAge(current);
+        Console.WriteLine($"  Current: {current}  ({currentMarker}, " +
+                          $"{(currentAge == "n/a" ? "not probed" : $"last probe {currentAge} ago")})");
+        Console.WriteLine($"  number = select · text = search · Enter = {current} · q = quit");
+        var retryCount = registry.Ids.Count(id => registry.IsInCatalog(id) && registry.IsError(id));
+        Console.WriteLine($"  /all full ({all.Count}) · /works only ✓ · /probe test all · " +
+                          $"/retry ! only ({retryCount}) · /help");
         Console.Write("model> ");
 
         var input = (Console.ReadLine() ?? "").Trim();
 
-        if (input.Length == 0) input = menuDefault;
-        if (input is "q" or "Q" or "quit") return null;
+        if (input.Length == 0) input = current;
+        if (input is "q" or "Q") return null;
 
-        if (input.Equals("all", StringComparison.OrdinalIgnoreCase))
+        // Anything starting with "/" is a command; everything else is a number,
+        // an exact id or a text search, so the two never collide.
+        if (input.StartsWith('/'))
         {
-            mode = "all";
-            continue;
+            var command = input[1..].Trim().ToLowerInvariant();
+
+            switch (command)
+            {
+                case "quit" or "exit":
+                    return null;
+
+                case "all":
+                    mode = "all";
+                    continue;
+
+                case "works":
+                    mode = "supported";
+                    search = "";
+                    continue;
+
+                case "help":
+                    PrintSelectorHelp();
+                    continue;
+
+                case "probe":
+                {
+                    // Skip ids that left the catalog: they only waste time.
+                    var ids = all.Where(registry.IsInCatalog).ToList();
+
+                    Console.Write($"  Probe all {ids.Count} models? This can take a few minutes. [y/N] ");
+                    var answer = (Console.ReadLine() ?? "").Trim();
+                    if (answer is not ("y" or "Y" or "yes" or "Yes" or "YES"))
+                    {
+                        Console.WriteLine("  (cancelled)");
+                        Console.WriteLine();
+                        continue;
+                    }
+
+                    Console.WriteLine();
+                    var batch = await ProbeBatchAsync(ids, retries: 0);
+                    registry.Save();
+                    PrintBatchSummary(batch);
+                    if (batch.Fatal is not null)
+                        Console.WriteLine($"  ! {batch.Fatal}. Check the API key or account credit.");
+                    Console.WriteLine();
+                    continue;
+                }
+
+                case "retry":
+                {
+                    var ids = registry.Ids
+                        .Where(id => registry.IsInCatalog(id) && registry.IsError(id))
+                        .ToList();
+
+                    if (ids.Count == 0)
+                    {
+                        Console.WriteLine("  No models in the error state.");
+                        Console.WriteLine();
+                        continue;
+                    }
+
+                    Console.WriteLine();
+                    var batch = await ProbeBatchAsync(ids, retries: probeRetries);
+                    registry.Save();
+                    PrintBatchSummary(batch);
+                    if (batch.Fatal is not null)
+                        Console.WriteLine($"  ! {batch.Fatal}. Check the API key or account credit.");
+                    Console.WriteLine();
+                    continue;
+                }
+
+                default:
+                    Console.WriteLine($"  Unknown command \"/{command}\". Type /help to see the commands.");
+                    Console.WriteLine();
+                    continue;
+            }
         }
 
         if (int.TryParse(input, out var n))
         {
-            if (n < 1 || n > shown.Count)
+            if (n < 1 || n > all.Count)
             {
-                Console.WriteLine($"  There is no number {n} (the list has {shown.Count}).");
+                Console.WriteLine($"  There is no number {n} (the full catalog has {all.Count}).");
                 Console.WriteLine();
                 continue;
             }
-            var picked = shown[n - 1];
-            if (await EnsureSupportedAsync(picked)) return picked;
-            mode = "supported";
+
+            // Numbers are positions in the full catalog, so they mean the same
+            // model in every view (works, search, all).
+            var picked = all[n - 1];
+            if (await TrySelectAsync(picked)) return picked;
             continue;
         }
 
         var exact = all.FirstOrDefault(id => id.Equals(input, StringComparison.OrdinalIgnoreCase));
         if (exact is not null)
         {
-            if (await EnsureSupportedAsync(exact)) return exact;
-            mode = "supported";
+            if (await TrySelectAsync(exact)) return exact;
             continue;
         }
 
         var matches = all.Where(id => id.Contains(input, StringComparison.OrdinalIgnoreCase)).ToList();
         if (matches.Count == 0)
         {
-            Console.WriteLine($"  No results for \"{input}\". Try another text or type all.");
+            Console.WriteLine($"  No results for \"{input}\". Try another text or type /all.");
             Console.WriteLine();
             continue;
         }
         if (matches.Count == 1)
         {
-            Console.WriteLine($"  → {matches[0]}");
-            if (await EnsureSupportedAsync(matches[0])) return matches[0];
-            mode = "supported";
+            Console.WriteLine($"  -> {matches[0]}");
+            if (await TrySelectAsync(matches[0])) return matches[0];
             continue;
         }
 
@@ -482,46 +616,43 @@ async Task<string?> SelectModelAsync(string menuDefault)
     }
 }
 
-// If the model is not known to work, test it. If it responds, save it to models.json.
-async Task<bool> EnsureSupportedAsync(string id)
+// Probe the model when it is untested or its last result is stale.
+async Task<bool> TrySelectAsync(string id)
 {
-    if (registry.IsSupported(id)) return true;
+    if (!registry.NeedsProbe(id, okTtl, errorTtl, deniedTtl)) return true;
 
-    Console.WriteLine();
-    Console.Write($"  Testing {id} (max {VerifyTimeoutSeconds}s)... ");
-    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(VerifyTimeoutSeconds));
+    var age = registry.GetAge(id);
+    Console.WriteLine(age == "n/a"
+        ? $"  Probing {id} (timeout {probeTimeoutSeconds}s)..."
+        : $"  Revalidating {id} (last probe {age} ago, timeout {probeTimeoutSeconds}s)...");
 
-    try
+    var result = await ProbeModelAsync(new NimChat(http, id), probeTimeoutSeconds, probeRetries);
+
+    if (result.Outcome == ProbeOutcome.Fatal)
     {
-        var probe = new NimChat(http, id);
-        var result = await probe.SendAsync([new ChatMessage("user", "Reply with just: ok")], maxTokens: 32, ct: cts.Token);
-        registry.Mark(id, true, reasoning: result.Reasoning);
-        registry.Save();
-        Console.WriteLine($"✔ responds ({registry.DescribeReasoning(id)}). Saved to models.json.");
-        return true;
-    }
-    catch (OperationCanceledException)
-    {
-        Console.WriteLine($"✘ no response within {VerifyTimeoutSeconds}s. Marked as failed.");
-        registry.Mark(id, false, "timeout");
-        registry.Save();
+        Console.WriteLine($"  ! {result.Detail}. Check the API key or account credit.");
+        Console.WriteLine();
         return false;
     }
-    catch (HttpRequestException ex)
+
+    registry.ApplyProbe(id, result);
+    registry.Save();
+
+    switch (result.Outcome)
     {
-        Console.WriteLine($"✘ {ex.Message.Split('\n')[0]}");
-        if (ex.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.Forbidden or HttpStatusCode.NotFound)
-        {
-            registry.Mark(id, false, $"HTTP {(int)ex.StatusCode}");
-            registry.Save();
-            Console.WriteLine("  Saved as failed in models.json.");
-        }
-        return false;
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"✘ {ex.Message.Split('\n')[0]}");
-        return false;
+        case ProbeOutcome.Responded:
+            var extra = result.Detail.Length > 0 ? $" [{result.Detail}]" : "";
+            Console.WriteLine($"  ✓ {id} responds ({registry.DescribeReasoning(id)}){extra}. Saved to models.json.");
+            Console.WriteLine();
+            return true;
+        case ProbeOutcome.Denied:
+            Console.WriteLine($"  ✗ {id}: not enabled ({result.Detail}). Saved to models.json.");
+            Console.WriteLine();
+            return false;
+        default:
+            Console.WriteLine($"  ✗ {id}: error ({result.Detail}). Saved to models.json.");
+            Console.WriteLine();
+            return false;
     }
 }
 
@@ -563,7 +694,7 @@ static async Task<(string Text, bool Reasoning)> PrintStreamAsync(NimChat nim, I
     return result;
 }
 
-static void PrintModelList(IReadOnlyList<string> ids, string header, Func<string, string> marker)
+static void PrintModelList(IReadOnlyList<string> ids, string header, ModelRegistry registry, TimeSpan okTtl, TimeSpan errorTtl, TimeSpan deniedTtl, bool showAge, IReadOnlyList<string> catalog)
 {
     Console.WriteLine();
     Console.WriteLine(header + ":");
@@ -575,10 +706,25 @@ static void PrintModelList(IReadOnlyList<string> ids, string header, Func<string
         return;
     }
 
-    var numberWidth = ids.Count.ToString().Length;
+    // Numbers are positions in the full catalog, so a filtered view keeps the
+    // number the model has in the "all" view.
+    var numberById = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    for (var i = 0; i < catalog.Count; i++) numberById[catalog[i]] = i + 1;
+
+    var numberWidth = catalog.Count.ToString().Length;
     var cells = new List<string>(ids.Count);
     for (var i = 0; i < ids.Count; i++)
-        cells.Add((i + 1).ToString().PadLeft(numberWidth) + $". {marker(ids[i])} {ids[i]}");
+    {
+        var stale = registry.IsStale(ids[i], okTtl, errorTtl, deniedTtl);
+        var number = (numberById.TryGetValue(ids[i], out var global) ? global : i + 1)
+            .ToString().PadLeft(numberWidth);
+        var marker = registry.GetMarker(ids[i]);
+
+        // The full catalog drops the age column so it still fits in two columns.
+        cells.Add(showAge
+            ? $"{number}. {marker} {registry.GetAge(ids[i]).PadLeft(4)}{(stale ? "*" : " ")} {ids[i]}"
+            : $"{number}. {marker}{(stale ? "*" : " ")} {ids[i]}");
+    }
 
     var maxLen = cells.Max(c => c.Length);
     var twoColumns = ids.Count > 10 && maxLen * 2 + 4 <= SafeWidth();
@@ -600,7 +746,11 @@ static void PrintModelList(IReadOnlyList<string> ids, string header, Func<string
     }
 
     Console.WriteLine();
-    Console.WriteLine("  R = reasoning | - = no reasoning | ? = unknown");
+    Console.WriteLine("  ? = untested | ✓ = works | ✗ = not enabled | ! = error | ∅ = not in catalog");
+    Console.WriteLine("  R = reasoning | NR = no reasoning | - = unknown");
+    Console.WriteLine("  age = time since the last probe | * = stale, revalidated when selected");
+    if (ids.Count != catalog.Count)
+        Console.WriteLine($"  number = position in the full catalog (1-{catalog.Count})");
     Console.WriteLine();
 }
 
@@ -609,8 +759,6 @@ static int SafeWidth()
     try { return Console.WindowWidth > 0 ? Console.WindowWidth : 120; }
     catch { return 120; }
 }
-
-static string DescribeReasoning(bool reasoning) => reasoning ? "reasoning: yes" : "reasoning: no";
 
 static string? ReadSavedModel(string path)
 {
@@ -628,23 +776,195 @@ static void SaveLastModel(string path, string model)
     try { File.WriteAllText(path, model + Environment.NewLine); } catch { /* not critical */ }
 }
 
+static int ReadIntEnv(string name, int fallback, int minimum)
+{
+    var raw = Environment.GetEnvironmentVariable(name);
+    return int.TryParse(raw, out var value) && value >= minimum ? value : fallback;
+}
+
+static (string State, string Detail) ClassifyChatError(Exception ex)
+{
+    if (ex is OperationCanceledException) return (ModelState.Error, "timeout");
+
+    if (ex is HttpRequestException http && http.StatusCode is { } status)
+    {
+        var code = (int)status;
+        var state = code is 400 or 403 or 404 or 410 ? ModelState.Denied : ModelState.Error;
+        return (state, $"HTTP {code}");
+    }
+
+    return (ModelState.Error, ex.Message.Split('\n')[0]);
+}
+
+// True when the API rejected the request because the conversation is longer
+// than the model's context window.
+static bool IsContextOverflow(Exception ex)
+{
+    if (ex is not HttpRequestException http) return false;
+    if (http.StatusCode is not { } status) return false;
+    if ((int)status is not (400 or 413)) return false;
+
+    var message = ex.Message;
+    return message.Contains("context", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("too long", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("maximum length", StringComparison.OrdinalIgnoreCase);
+}
+
+// Drops the oldest half of the history in pairs, so it still starts with a
+// "user" message and the last exchange is kept.
+static int TrimHistory(List<ChatMessage> history)
+{
+    var droppable = Math.Max(0, history.Count - 2);
+    var drop = Math.Min(droppable, Math.Max(2, history.Count / 2));
+    drop -= drop % 2;
+    if (drop <= 0) return 0;
+
+    history.RemoveRange(0, drop);
+    return drop;
+}
+
+// Probes a batch of models (3 at a time), printing one line per model as it
+// finishes. Used by --probe-all and by the "probe" / "retry" selector commands.
+async Task<BatchResult> ProbeBatchAsync(IReadOnlyList<string> ids, int retries)
+{
+    var started = DateTimeOffset.Now;
+    var results = new List<(string Id, ProbeResult Result)>();
+    var total = ids.Count;
+    string? fatal = null;
+
+    using var gate = new SemaphoreSlim(3);
+    using var abort = new CancellationTokenSource();
+
+    await Task.WhenAll(ids.Select(async id =>
+    {
+        if (abort.IsCancellationRequested) return;
+        await gate.WaitAsync();
+        try
+        {
+            if (abort.IsCancellationRequested) return;
+
+            var result = await ProbeModelAsync(new NimChat(http, id), probeTimeoutSeconds, retries, abort.Token);
+            if (abort.IsCancellationRequested) return;
+
+            if (result.Outcome == ProbeOutcome.Fatal)
+            {
+                fatal ??= $"{id}: {result.Detail}";
+                abort.Cancel();
+                return;
+            }
+
+            registry.ApplyProbe(id, result);
+
+            lock (results)
+            {
+                results.Add((id, result));
+                var label = result.Outcome switch
+                {
+                    ProbeOutcome.Responded => "OK",
+                    ProbeOutcome.Denied => "DENIED",
+                    _ => "ERROR"
+                };
+                var detail = result.Outcome == ProbeOutcome.Responded
+                    ? $"({registry.DescribeReasoning(id)})"
+                    : $"({result.Detail})";
+                Console.WriteLine($"{label,-7} {id}  {detail}   [{results.Count}/{total}]");
+            }
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }));
+
+    return new BatchResult(results, fatal, DateTimeOffset.Now - started, total);
+}
+
+static void PrintBatchSummary(BatchResult batch)
+{
+    var ok = batch.Results.Count(r => r.Result.Outcome == ProbeOutcome.Responded);
+    var denied = batch.Results.Count(r => r.Result.Outcome == ProbeOutcome.Denied);
+    var error = batch.Results.Count(r => r.Result.Outcome == ProbeOutcome.Transient);
+
+    Console.WriteLine();
+    Console.WriteLine($"OK: {ok}   DENIED: {denied}   ERROR: {error}   TOTAL: {batch.Results.Count}" +
+                      $"{(batch.Results.Count < batch.Total ? $" of {batch.Total}" : "")}   " +
+                      $"in {FormatDuration(batch.Elapsed)}");
+}
+
+static string FormatDuration(TimeSpan elapsed)
+    => elapsed.TotalSeconds < 60
+        ? $"{(int)elapsed.TotalSeconds}s"
+        : $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds}s";
+
+// Runs one probe with retries for transient failures.
+static async Task<ProbeResult> ProbeModelAsync(NimChat nim, int timeoutSeconds, int retries, CancellationToken external = default)
+{
+    for (var attempt = 0; ; attempt++)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(external);
+        cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+
+        var result = await nim.ProbeAsync(cts.Token);
+        if (external.IsCancellationRequested) return result;
+        if (result.Outcome != ProbeOutcome.Transient || attempt >= retries) return result;
+
+        try { await Task.Delay(TimeSpan.FromSeconds(2), external); }
+        catch (OperationCanceledException) { return result; }
+    }
+}
+
+static void PrintSelectorHelp()
+{
+    Console.WriteLine();
+    Console.WriteLine("  Selector commands:");
+    Console.WriteLine("    /all      show the full catalog");
+    Console.WriteLine("    /works    show only the models marked ✓");
+    Console.WriteLine("    /probe    test every model (asks for confirmation)");
+    Console.WriteLine("    /retry    test only the models marked !");
+    Console.WriteLine("    /quit     leave the selector");
+    Console.WriteLine("  Anything else is a number (position in the full catalog), an exact");
+    Console.WriteLine("  model id, or a text to search by name. Enter keeps the current model.");
+    Console.WriteLine();
+}
+
 static void PrintHelp()
 {
     Console.WriteLine("""
-        nim-hello — console chat client for NVIDIA NIM
+        nim-hello - console chat client for NVIDIA NIM
 
         Usage:
           dotnet run                       interactive chat (with model selector)
           dotnet run -- "question"         one-shot question, no menu
           dotnet run -- --model <id>       use that model and skip the menu
-          dotnet run -- --models           list the catalog (85 ids)
+          dotnet run -- --models           list the catalog and sync models.json
           dotnet run -- --probe            test 5 models
           dotnet run -- --probe-all        test the whole catalog and update models.json
 
+        In the model selector:
+          number                          pick that position in the full catalog
+          text                            search by id
+          /all                            show the full catalog
+          /works                          show only the models marked ✓
+          /probe                          test every model (asks for confirmation)
+          /retry                          test only the models marked !
+          /help                           list the selector commands
+          /quit (or q)                    quit
+
+        In the chat:
+          /model [id]                     switch model, keeping the conversation
+          /thinking                       show or hide the reasoning
+          /reset                          clear the conversation
+          /quit                           exit
+
         Environment variables:
-          NVIDIA_MODEL       model to use (skips the menu)
-          NVIDIA_MAX_TOKENS  max tokens per reply (default 2048)
-          NIM_HOME           folder for models.json / .model / .key
+          NVIDIA_MODEL                  model to use (skips the menu)
+          NVIDIA_MAX_TOKENS             max tokens per reply (default 2048)
+          NIM_HOME                      folder for models.json / .model / .key
+          NVIDIA_PROBE_TIMEOUT          seconds per probe attempt (default 30)
+          NVIDIA_PROBE_RETRIES          retries for transient probe errors (default 1)
+          NVIDIA_REPROBE_OK_DAYS        revalidate working models after N days (default 7)
+          NVIDIA_REPROBE_ERROR_MINUTES  retry errored models after N minutes (default 60)
+          NVIDIA_REPROBE_DENIED_DAYS    retry denied models after N days (default 30)
         """);
 }
 
@@ -665,36 +985,38 @@ internal sealed class NimChat
         _model = model;
     }
 
-    /// <summary>Regular request (no streaming). Used to test models.</summary>
-    public async Task<(string Text, bool Reasoning)> SendAsync(
-        IReadOnlyList<ChatMessage> history,
-        int maxTokens = 500,
-        CancellationToken ct = default)
+    /// <summary>
+    /// Quick reachability probe: stream a tiny request and stop at the first
+    /// token (content or reasoning). Proves the model is enabled without
+    /// waiting for a full answer.
+    /// </summary>
+    public async Task<ProbeResult> ProbeAsync(CancellationToken ct = default)
     {
-        var payload = new
+        try
         {
-            model = _model,
-            messages = history,
-            temperature = 0.6,
-            max_tokens = maxTokens,
-            stream = false
-        };
+            var (text, reasoning) = await StreamAsync(
+                [new ChatMessage("user", "ping")],
+                onContent: _ => { },
+                onReasoning: _ => { },
+                maxTokens: 64,
+                ct: ct,
+                stopAfterFirstToken: true);
 
-        using var content = new StringContent(JsonSerializer.Serialize(payload, JsonOpts), Encoding.UTF8, "application/json");
-        using var response = await _http.PostAsync(Endpoint, content, ct);
-        var body = await response.Content.ReadAsStringAsync(ct);
-
-        if (!response.IsSuccessStatusCode)
-            throw new HttpRequestException(BuildHttpError((int)response.StatusCode, body), null, response.StatusCode);
-
-        using var doc = JsonDocument.Parse(body);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-
-        var reasoning = GetText(message, "reasoning_content").Length > 0
-                        || GetText(message, "reasoning").Length > 0
-                        || HasReasoningTokens(doc.RootElement);
-
-        return (GetText(message, "content"), reasoning);
+            var detail = text.Length == 0 && !reasoning ? "no content" : "";
+            return new ProbeResult(ProbeOutcome.Responded, reasoning, detail);
+        }
+        catch (OperationCanceledException)
+        {
+            return new ProbeResult(ProbeOutcome.Transient, false, "timeout");
+        }
+        catch (HttpRequestException ex)
+        {
+            return Classify(ex);
+        }
+        catch (Exception ex)
+        {
+            return new ProbeResult(ProbeOutcome.Transient, false, ex.Message.Split('\n')[0]);
+        }
     }
 
     /// <summary>Streaming SSE request. Separates "thinking" (reasoning) from the reply.</summary>
@@ -703,7 +1025,8 @@ internal sealed class NimChat
         Action<string> onContent,
         Action<string>? onReasoning = null,
         int maxTokens = 1024,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool stopAfterFirstToken = false)
     {
         var payload = new
         {
@@ -734,6 +1057,7 @@ internal sealed class NimChat
         using var reader = new StreamReader(stream, Encoding.UTF8);
         var reply = new StringBuilder();
         var sawReasoning = false;
+        var sawToken = false;
 
         while (await reader.ReadLineAsync(timeout.Token) is { } line)
         {
@@ -756,6 +1080,7 @@ internal sealed class NimChat
             if (reasoning.Length > 0)
             {
                 sawReasoning = true;
+                sawToken = true;
                 onReasoning?.Invoke(reasoning);
             }
 
@@ -763,8 +1088,11 @@ internal sealed class NimChat
             if (content.Length > 0)
             {
                 reply.Append(content);
+                sawToken = true;
                 onContent(content);
             }
+
+            if (stopAfterFirstToken && sawToken) break;
         }
 
         return (reply.ToString(), sawReasoning);
@@ -791,13 +1119,19 @@ internal sealed class NimChat
             ? value.GetString() ?? ""
             : "";
 
-    /// <summary>True when usage.completion_tokens_details.reasoning_tokens is greater than zero.</summary>
-    private static bool HasReasoningTokens(JsonElement root)
+    private static ProbeResult Classify(HttpRequestException ex)
     {
-        if (!root.TryGetProperty("usage", out var usage)) return false;
-        if (!usage.TryGetProperty("completion_tokens_details", out var details)) return false;
-        if (!details.TryGetProperty("reasoning_tokens", out var tokens)) return false;
-        return tokens.ValueKind == JsonValueKind.Number && tokens.TryGetInt32(out var count) && count > 0;
+        if (ex.StatusCode is not { } status)
+            return new ProbeResult(ProbeOutcome.Transient, false, ex.Message.Split('\n')[0]);
+
+        var code = (int)status;
+        var detail = $"HTTP {code}";
+        return code switch
+        {
+            401 or 402 => new ProbeResult(ProbeOutcome.Fatal, false, detail),
+            400 or 403 or 404 or 410 => new ProbeResult(ProbeOutcome.Denied, false, detail),
+            _ => new ProbeResult(ProbeOutcome.Transient, false, detail)
+        };
     }
 
     private string BuildHttpError(int status, string body)
@@ -807,6 +1141,7 @@ internal sealed class NimChat
             401 or 403 => "Invalid key or no permission for this model.",
             402 => "No credit on the account.",
             404 => $"Model '{_model}' is not enabled for your account. Use /model or --probe-all.",
+            410 => $"Model '{_model}' is no longer available. Use /model or --probe-all.",
             429 => "Rate limit: wait a few seconds and retry.",
             _ => ""
         };
@@ -820,6 +1155,9 @@ internal sealed class NimChat
 /// <summary>models.json: external list of models and whether they work with this account.</summary>
 internal sealed class ModelRegistry
 {
+    public const int SchemaVersion = 2;
+    private const int MinCatalogSize = 10;
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -841,18 +1179,30 @@ internal sealed class ModelRegistry
         try
         {
             var file = JsonSerializer.Deserialize<ModelFile>(File.ReadAllText(path), JsonOpts);
-            foreach (var entry in file?.Models ?? [])
+
+            // Old or unknown schemas are backed up and ignored; they are not migrated.
+            if (file?.SchemaVersion != SchemaVersion)
+            {
+                Backup(path);
+                Console.Error.WriteLine($"[warning] {Path.GetFileName(path)} uses an old format; " +
+                                        $"backed up to {Path.GetFileName(path)}.bak and started fresh.");
+                return registry;
+            }
+
+            foreach (var entry in file.Models ?? [])
             {
                 if (string.IsNullOrWhiteSpace(entry.Id)) continue;
                 entry.Id = entry.Id.Trim();
-                if (entry.State is not (ModelState.Ok or ModelState.Failed or ModelState.Unprobed))
+                if (entry.State is not (ModelState.Ok or ModelState.Denied or ModelState.Error or ModelState.Unprobed))
                     entry.State = ModelState.Unprobed;
                 registry._entries[entry.Id] = entry;
             }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[warning] could not read {Path.GetFileName(path)}: {ex.Message}");
+            Backup(path);
+            Console.Error.WriteLine($"[warning] could not read {Path.GetFileName(path)}: {ex.Message} " +
+                                    $"(backed up to {Path.GetFileName(path)}.bak)");
         }
 
         return registry;
@@ -870,29 +1220,33 @@ internal sealed class ModelRegistry
 
     public bool IsSupported(string id) => _entries.TryGetValue(id, out var entry) && entry.State == ModelState.Ok;
 
+    public bool IsError(string id) => _entries.TryGetValue(id, out var entry) && entry.State == ModelState.Error;
+
+    public bool IsInCatalog(string id) => !_entries.TryGetValue(id, out var entry) || entry.InCatalog;
+
     /// <summary>
-    /// Marker for the list: state (✔ works, ✘ failed, space = untested) plus
-    /// reasoning (R = reasoning, - = no reasoning, ? = unknown).
+    /// Marker for the list: state (?, ✓, ✗, !, ∅) and reasoning (R, NR, -).
     /// </summary>
     public string GetMarker(string id)
     {
-        if (!_entries.TryGetValue(id, out var entry)) return "  ";
+        if (!_entries.TryGetValue(id, out var entry)) return "? -";
 
-        var state = entry.State switch
+        var state = !entry.InCatalog ? "∅" : entry.State switch
         {
-            ModelState.Ok => "✔",
-            ModelState.Failed => "✘",
-            _ => " "
+            ModelState.Ok => "✓",
+            ModelState.Denied => "✗",
+            ModelState.Error => "!",
+            _ => "?"
         };
 
         var reasoning = entry.Reasoning switch
         {
             true => "R",
-            false => "-",
-            null => "?"
+            false => "NR",
+            null => "-"
         };
 
-        return state + reasoning;
+        return $"{state} {reasoning}";
     }
 
     /// <summary>Human-readable reasoning status for the model header line.</summary>
@@ -907,66 +1261,117 @@ internal sealed class ModelRegistry
         };
     }
 
-    /// <summary>Stores whether the model exposes reasoning. Returns true when the value changed.</summary>
-    public bool SetReasoning(string id, bool reasoning)
+    /// <summary>Compact age of the last probe: "5m", "3h", "9d" or "n/a".</summary>
+    public string GetAge(string id)
     {
-        if (!_entries.TryGetValue(id, out var entry))
-        {
-            entry = new ModelEntry { Id = id };
-            _entries[id] = entry;
-        }
+        if (!_entries.TryGetValue(id, out var entry) || entry.LastProbe is null) return "n/a";
 
-        if (entry.Reasoning == reasoning) return false;
-        entry.Reasoning = reasoning;
-        return true;
+        var age = DateTimeOffset.Now - entry.LastProbe.Value;
+        if (age < TimeSpan.Zero) age = TimeSpan.Zero;
+        if (age.TotalMinutes < 60) return $"{Math.Max(1, (int)age.TotalMinutes)}m";
+        if (age.TotalHours < 24) return $"{(int)age.TotalHours}h";
+        return $"{(int)age.TotalDays}d";
     }
 
-    /// <summary>Adds any missing official catalog ids as "unprobed".</summary>
-    public int SyncCatalog(IEnumerable<string> catalog)
+    /// <summary>True when the last result is older than its state's TTL.</summary>
+    public bool IsStale(string id, TimeSpan okTtl, TimeSpan errorTtl, TimeSpan deniedTtl)
     {
+        if (!_entries.TryGetValue(id, out var entry) || entry.LastProbe is null) return false;
+
+        var age = DateTimeOffset.Now - entry.LastProbe.Value;
+        return entry.State switch
+        {
+            ModelState.Ok => age > okTtl,
+            ModelState.Error => age > errorTtl,
+            ModelState.Denied => age > deniedTtl,
+            _ => false
+        };
+    }
+
+    /// <summary>Untested models and stale results must be probed before use.</summary>
+    public bool NeedsProbe(string id, TimeSpan okTtl, TimeSpan errorTtl, TimeSpan deniedTtl)
+    {
+        if (!_entries.TryGetValue(id, out var entry)) return true;
+        if (entry.State == ModelState.Unprobed || entry.LastProbe is null) return true;
+        return IsStale(id, okTtl, errorTtl, deniedTtl);
+    }
+
+    /// <summary>Adds missing catalog ids and flags entries that left the catalog.</summary>
+    public (int Added, bool Changed) SyncCatalog(IReadOnlyList<string> catalog)
+    {
+        if (catalog.Count < MinCatalogSize) return (0, false);
+
+        var ids = new HashSet<string>(catalog, StringComparer.OrdinalIgnoreCase);
         var added = 0;
+
         foreach (var id in catalog)
         {
             if (string.IsNullOrWhiteSpace(id) || _entries.ContainsKey(id)) continue;
-            _entries[id] = new ModelEntry { Id = id, State = ModelState.Unprobed };
+            _entries[id] = new ModelEntry { Id = id, State = ModelState.Unprobed, InCatalog = true };
             added++;
         }
-        return added;
-    }
 
-    public void Mark(string id, bool supported, string? note = null, bool? reasoning = null)
-    {
-        if (!_entries.TryGetValue(id, out var entry))
+        var changed = added > 0;
+        foreach (var entry in _entries.Values)
         {
-            entry = new ModelEntry { Id = id };
-            _entries[id] = entry;
+            var inCatalog = ids.Contains(entry.Id);
+            if (entry.InCatalog == inCatalog) continue;
+            entry.InCatalog = inCatalog;
+            changed = true;
         }
 
-        entry.State = supported ? ModelState.Ok : ModelState.Failed;
-        entry.Note = supported ? null : note;
-        if (reasoning.HasValue) entry.Reasoning = reasoning;
+        return (added, changed);
     }
 
-    public void ApplyProbe(IEnumerable<(string Id, string Status, bool Reasoning)> results)
+    /// <summary>Stores a probe result. Fatal errors are not recorded.</summary>
+    public void ApplyProbe(string id, ProbeResult result)
     {
-        foreach (var (id, status, reasoning) in results)
-        {
-            if (!_entries.TryGetValue(id, out var entry))
-            {
-                entry = new ModelEntry { Id = id };
-                _entries[id] = entry;
-            }
+        if (result.Outcome == ProbeOutcome.Fatal) return;
 
-            entry.State = status == "OK" ? ModelState.Ok : ModelState.Failed;
-            if (status != "OK")
-            {
-                entry.Note = status == "TIMEOUT" ? "timeout" : "no response";
-            }
-            else
-            {
-                entry.Reasoning = reasoning;
-            }
+        var entry = GetOrAdd(id);
+        entry.LastProbe = DateTimeOffset.Now;
+
+        switch (result.Outcome)
+        {
+            case ProbeOutcome.Responded:
+                entry.State = ModelState.Ok;
+                entry.Reasoning = result.Reasoning;
+                entry.LastError = result.Detail.Length > 0 ? result.Detail : null;
+                break;
+            case ProbeOutcome.Denied:
+                entry.State = ModelState.Denied;
+                entry.LastError = result.Detail;
+                break;
+            default:
+                entry.State = ModelState.Error;
+                entry.LastError = result.Detail;
+                break;
         }
+    }
+
+    /// <summary>Records a successful chat reply. Returns true when the visible state changed.</summary>
+    public bool MarkChatSuccess(string id, bool reasoning)
+    {
+        var entry = GetOrAdd(id);
+        var changed = entry.State != ModelState.Ok || entry.Reasoning != reasoning;
+
+        entry.State = ModelState.Ok;
+        entry.Reasoning = reasoning;
+        entry.LastError = null;
+        entry.LastProbe = DateTimeOffset.Now;
+        return changed;
+    }
+
+    /// <summary>Records a failed chat request. Returns true when the visible state changed.</summary>
+    public bool MarkChatError(string id, string state, string detail)
+    {
+        var entry = GetOrAdd(id);
+        var changed = entry.State != state || entry.LastError != detail;
+
+        entry.State = state;
+        entry.LastError = detail;
+        entry.LastProbe = DateTimeOffset.Now;
+        return changed;
     }
 
     public void Save()
@@ -975,13 +1380,15 @@ internal sealed class ModelRegistry
         {
             var file = new ModelFile
             {
+                SchemaVersion = SchemaVersion,
                 Updated = DateTimeOffset.Now.ToString("O"),
                 Models = _entries.Values
                     .OrderBy(e => e.State switch
                     {
                         ModelState.Ok => 0,
-                        ModelState.Failed => 1,
-                        _ => 2
+                        ModelState.Denied => 1,
+                        ModelState.Error => 2,
+                        _ => 3
                     })
                     .ThenBy(e => e.Id, StringComparer.OrdinalIgnoreCase)
                     .ToList()
@@ -993,17 +1400,45 @@ internal sealed class ModelRegistry
             Console.Error.WriteLine($"[warning] could not save {Path.GetFileName(_path)}: {ex.Message}");
         }
     }
+
+    private ModelEntry GetOrAdd(string id)
+    {
+        if (_entries.TryGetValue(id, out var entry)) return entry;
+        entry = new ModelEntry { Id = id, InCatalog = true };
+        _entries[id] = entry;
+        return entry;
+    }
+
+    private static void Backup(string path)
+    {
+        try { File.Copy(path, path + ".bak", overwrite: true); } catch { /* not critical */ }
+    }
 }
 
 internal static class ModelState
 {
     public const string Ok = "ok";             // tested and it works
-    public const string Failed = "failed";     // tested and it does not work
+    public const string Denied = "denied";     // rejected for this account (400/403/404)
+    public const string Error = "error";       // timeout, 429, 5xx or network failure
     public const string Unprobed = "unprobed"; // in the catalog, never tested
 }
 
+internal enum ProbeOutcome
+{
+    Responded,
+    Denied,
+    Transient,
+    Fatal
+}
+
+internal sealed record ProbeResult(ProbeOutcome Outcome, bool Reasoning, string Detail);
+
+/// <summary>Outcome of probing a batch of models.</summary>
+internal sealed record BatchResult(List<(string Id, ProbeResult Result)> Results, string? Fatal, TimeSpan Elapsed, int Total);
+
 internal sealed class ModelFile
 {
+    public int SchemaVersion { get; set; }
     public string? Updated { get; set; }
     public List<ModelEntry> Models { get; set; } = [];
 }
@@ -1016,7 +1451,17 @@ internal sealed class ModelEntry
     /// <summary>True = the model emits reasoning, false = it does not, null = not observed yet.</summary>
     public bool? Reasoning { get; set; }
 
+    /// <summary>Human note; left untouched by the app.</summary>
     public string? Note { get; set; }
+
+    /// <summary>Detail of the last failed probe or chat request.</summary>
+    public string? LastError { get; set; }
+
+    /// <summary>When the model was last probed or used successfully.</summary>
+    public DateTimeOffset? LastProbe { get; set; }
+
+    /// <summary>False when the id disappeared from the official catalog.</summary>
+    public bool InCatalog { get; set; } = true;
 }
 
 internal sealed record ChatMessage(string Role, string Content);

@@ -24,6 +24,7 @@ bld/
 .env
 .model
 models.json
+models.json.bak
 
 # Logs
 *.log
