@@ -441,39 +441,108 @@ async Task<string?> SelectModelAsync(string current)
         return null;
     }
 
-    var mode = "supported";
+    var mode = "working";
     var search = "";
+
+    // Turns a target word, a full-catalog number or a model id into a list of
+    // ids. /probe and /forget share it, so both speak the same vocabulary.
+    List<string>? ResolveTargets(string argument)
+    {
+        var word = argument.Trim();
+        if (word.Length == 0)
+        {
+            Console.WriteLine("  Missing target: a number, an id, or " +
+                              "all/working/failed/untested/denied.");
+            Console.WriteLine();
+            return null;
+        }
+
+        switch (word.ToLowerInvariant())
+        {
+            case "all":
+                return all.Where(registry.IsInCatalog).ToList();
+            case "working":
+                return all.Where(id => registry.IsSupported(id) && registry.IsInCatalog(id)).ToList();
+            case "failed":
+                return all.Where(id => registry.IsError(id) && registry.IsInCatalog(id)).ToList();
+            case "untested":
+                return all.Where(id => registry.IsUntested(id) && registry.IsInCatalog(id)).ToList();
+            case "denied":
+                return all.Where(id => registry.IsDenied(id) && registry.IsInCatalog(id)).ToList();
+        }
+
+        if (int.TryParse(word, out var n))
+        {
+            if (n < 1 || n > all.Count)
+            {
+                Console.WriteLine($"  There is no number {n} (the full catalog has {all.Count}).");
+                Console.WriteLine();
+                return null;
+            }
+
+            return [all[n - 1]];
+        }
+
+        var exact = all.FirstOrDefault(id => id.Equals(word, StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return [exact];
+
+        var matches = all.Where(id => id.Contains(word, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (matches.Count == 1) return matches;
+
+        Console.WriteLine(matches.Count == 0
+            ? $"  No model matches \"{word}\"."
+            : $"  \"{word}\" matches {matches.Count} models. Use a number or the full id.");
+        Console.WriteLine();
+        return null;
+    }
 
     while (true)
     {
         List<string> shown;
         string header;
 
-        if (mode == "all")
+        switch (mode)
         {
-            shown = all;
-            header = $"Full catalog ({all.Count})";
-        }
-        else if (mode == "search")
-        {
-            shown = all.Where(id => id.Contains(search, StringComparison.OrdinalIgnoreCase)).ToList();
-            header = $"Results for \"{search}\" ({shown.Count} of {all.Count})";
-        }
-        else
-        {
-            shown = registry.Ids
-                .Where(registry.IsSupported)
-                .ToList();
-
-            if (shown.Count == 0)
-            {
+            case "all":
                 shown = all;
-                header = $"No usable tested models - full catalog ({all.Count})";
-            }
-            else
-            {
-                header = $"Models that work with your account ({shown.Count} of {all.Count})";
-            }
+                header = $"Full catalog ({all.Count})";
+                break;
+
+            case "search":
+                shown = all.Where(id => id.Contains(search, StringComparison.OrdinalIgnoreCase)).ToList();
+                header = $"Results for \"{search}\" ({shown.Count} of {all.Count})";
+                break;
+
+            case "failed":
+                shown = all.Where(id => registry.IsError(id) && registry.IsInCatalog(id)).ToList();
+                header = $"Models that failed the last probe ({shown.Count} of {all.Count})";
+                break;
+
+            case "untested":
+                shown = all.Where(id => registry.IsUntested(id) && registry.IsInCatalog(id)).ToList();
+                header = $"Models not probed yet ({shown.Count} of {all.Count})";
+                break;
+
+            case "denied":
+                shown = all.Where(id => registry.IsDenied(id) && registry.IsInCatalog(id)).ToList();
+                header = $"Models not enabled for your account ({shown.Count} of {all.Count})";
+                break;
+
+            default: // "working"
+                shown = registry.Ids
+                    .Where(registry.IsSupported)
+                    .ToList();
+
+                if (shown.Count == 0)
+                {
+                    shown = all;
+                    header = $"No usable tested models - full catalog ({all.Count})";
+                }
+                else
+                {
+                    header = $"Models that work with your account ({shown.Count} of {all.Count})";
+                }
+                break;
         }
 
         var stale = shown.Count(id => registry.IsStale(id, okTtl, errorTtl, deniedTtl));
@@ -486,9 +555,13 @@ async Task<string?> SelectModelAsync(string current)
         Console.WriteLine($"  Current: {current}  ({currentMarker}, " +
                           $"{(currentAge == "n/a" ? "not probed" : $"last probe {currentAge} ago")})");
         Console.WriteLine($"  number = select · text = search · Enter = {current} · q = quit");
-        var retryCount = registry.Ids.Count(id => registry.IsInCatalog(id) && registry.IsError(id));
-        Console.WriteLine($"  /all full ({all.Count}) · /works only ✓ · /probe test all · " +
-                          $"/retry ! only ({retryCount}) · /help");
+        Console.WriteLine(
+            $"  /list all ({all.Count}) · " +
+            $"working ({all.Count(id => registry.IsSupported(id) && registry.IsInCatalog(id))}) · " +
+            $"failed ({all.Count(id => registry.IsError(id) && registry.IsInCatalog(id))}) · " +
+            $"untested ({all.Count(id => registry.IsUntested(id) && registry.IsInCatalog(id))}) · " +
+            $"denied ({all.Count(id => registry.IsDenied(id) && registry.IsInCatalog(id))})");
+        Console.WriteLine("  /probe <target> now · /forget <target> reset · /help");
         Console.Write("model> ");
 
         var input = (Console.ReadLine() ?? "").Trim();
@@ -500,42 +573,69 @@ async Task<string?> SelectModelAsync(string current)
         // an exact id or a text search, so the two never collide.
         if (input.StartsWith('/'))
         {
-            var command = input[1..].Trim().ToLowerInvariant();
+            var body = input[1..].Trim();
+            var space = body.IndexOfAny([' ', '\t']);
+            var command = (space < 0 ? body : body[..space]).ToLowerInvariant();
+            var argument = space < 0 ? "" : body[(space + 1)..].Trim();
 
             switch (command)
             {
                 case "quit" or "exit":
                     return null;
 
-                case "all":
-                    mode = "all";
-                    continue;
-
-                case "works":
-                    mode = "supported";
-                    search = "";
-                    continue;
-
                 case "help":
                     PrintSelectorHelp();
                     continue;
 
-                case "probe":
+                case "list":
                 {
-                    // Skip ids that left the catalog: they only waste time.
-                    var ids = all.Where(registry.IsInCatalog).ToList();
-
-                    Console.Write($"  Probe all {ids.Count} models? This can take a few minutes. [y/N] ");
-                    var answer = (Console.ReadLine() ?? "").Trim();
-                    if (answer is not ("y" or "Y" or "yes" or "Yes" or "YES"))
+                    var view = argument.ToLowerInvariant();
+                    if (view is not ("all" or "working" or "failed" or "untested" or "denied"))
                     {
-                        Console.WriteLine("  (cancelled)");
+                        Console.WriteLine("  /list expects all, working, failed, untested or denied.");
                         Console.WriteLine();
                         continue;
                     }
 
+                    mode = view;
+                    search = "";
+                    continue;
+                }
+
+                case "probe":
+                {
+                    var ids = ResolveTargets(argument);
+                    if (ids is null) continue;
+
+                    if (ids.Count == 0)
+                    {
+                        Console.WriteLine($"  No models in the {argument} state.");
+                        Console.WriteLine();
+                        continue;
+                    }
+
+                    if (ids.Count > 1)
+                    {
+                        Console.Write(argument.Equals("all", StringComparison.OrdinalIgnoreCase)
+                            ? $"  Probe all {ids.Count} models? This can take a few minutes. [y/N] "
+                            : $"  Probe {ids.Count} models? [y/N] ");
+                        var answer = (Console.ReadLine() ?? "").Trim();
+                        if (answer is not ("y" or "Y" or "yes" or "Yes" or "YES"))
+                        {
+                            Console.WriteLine("  (cancelled)");
+                            Console.WriteLine();
+                            continue;
+                        }
+                    }
+
+                    // A full sweep stays fast: no retries. Anything you aimed at
+                    // explicitly gets the configured retries.
+                    var retries = argument.Equals("all", StringComparison.OrdinalIgnoreCase)
+                        ? 0
+                        : probeRetries;
+
                     Console.WriteLine();
-                    var batch = await ProbeBatchAsync(ids, retries: 0);
+                    var batch = await ProbeBatchAsync(ids, retries);
                     registry.Save();
                     PrintBatchSummary(batch);
                     if (batch.Fatal is not null)
@@ -544,25 +644,36 @@ async Task<string?> SelectModelAsync(string current)
                     continue;
                 }
 
-                case "retry":
+                case "forget":
                 {
-                    var ids = registry.Ids
-                        .Where(id => registry.IsInCatalog(id) && registry.IsError(id))
-                        .ToList();
+                    var ids = ResolveTargets(argument);
+                    if (ids is null) continue;
 
                     if (ids.Count == 0)
                     {
-                        Console.WriteLine("  No models in the error state.");
+                        Console.WriteLine($"  No models in the {argument} state.");
                         Console.WriteLine();
                         continue;
                     }
 
-                    Console.WriteLine();
-                    var batch = await ProbeBatchAsync(ids, retries: probeRetries);
+                    if (ids.Count > 1)
+                    {
+                        Console.Write($"  Forget the stored result of {ids.Count} models? [y/N] ");
+                        var answer = (Console.ReadLine() ?? "").Trim();
+                        if (answer is not ("y" or "Y" or "yes" or "Yes" or "YES"))
+                        {
+                            Console.WriteLine("  (cancelled)");
+                            Console.WriteLine();
+                            continue;
+                        }
+                    }
+
+                    var forgotten = ids.Count(registry.Forget);
                     registry.Save();
-                    PrintBatchSummary(batch);
-                    if (batch.Fatal is not null)
-                        Console.WriteLine($"  ! {batch.Fatal}. Check the API key or account credit.");
+
+                    Console.WriteLine(ids.Count == 1
+                        ? $"  {ids[0]}: back to \"?\", probed again when selected."
+                        : $"  {forgotten} of {ids.Count} models back to \"?\", probed again when selected.");
                     Console.WriteLine();
                     continue;
                 }
@@ -600,7 +711,7 @@ async Task<string?> SelectModelAsync(string current)
         var matches = all.Where(id => id.Contains(input, StringComparison.OrdinalIgnoreCase)).ToList();
         if (matches.Count == 0)
         {
-            Console.WriteLine($"  No results for \"{input}\". Try another text or type /all.");
+            Console.WriteLine($"  No results for \"{input}\". Try another text or type /list all.");
             Console.WriteLine();
             continue;
         }
@@ -917,11 +1028,24 @@ static void PrintSelectorHelp()
 {
     Console.WriteLine();
     Console.WriteLine("  Selector commands:");
-    Console.WriteLine("    /all      show the full catalog");
-    Console.WriteLine("    /works    show only the models marked ✓");
-    Console.WriteLine("    /probe    test every model (asks for confirmation)");
-    Console.WriteLine("    /retry    test only the models marked !");
-    Console.WriteLine("    /quit     leave the selector");
+    Console.WriteLine("    /list all       show the full catalog");
+    Console.WriteLine("    /list working   show only the models marked ✓");
+    Console.WriteLine("    /list failed    show only the models marked !");
+    Console.WriteLine("    /list untested  show only the models marked ?");
+    Console.WriteLine("    /list denied    show only the models marked ✗");
+    Console.WriteLine();
+    Console.WriteLine("    /probe all      test every model in the catalog");
+    Console.WriteLine("    /probe failed   test only the models marked !");
+    Console.WriteLine("    /probe denied   test only the models marked ✗");
+    Console.WriteLine("    /probe 22       test the model at position 22");
+    Console.WriteLine("    /probe <id>     test that model (a unique part of the id works too)");
+    Console.WriteLine();
+    Console.WriteLine("    /forget 22      drop the stored result: it goes back to ?");
+    Console.WriteLine("    /quit           leave the selector");
+    Console.WriteLine();
+    Console.WriteLine("  /probe and /forget take the same words: all, working, failed,");
+    Console.WriteLine("  untested, denied, a number, or an id. Sets ask for confirmation;");
+    Console.WriteLine("  a single model does not.");
     Console.WriteLine("  Anything else is a number (position in the full catalog), an exact");
     Console.WriteLine("  model id, or a text to search by name. Enter keeps the current model.");
     Console.WriteLine();
@@ -943,10 +1067,10 @@ static void PrintHelp()
         In the model selector:
           number                          pick that position in the full catalog
           text                            search by id
-          /all                            show the full catalog
-          /works                          show only the models marked ✓
-          /probe                          test every model (asks for confirmation)
-          /retry                          test only the models marked !
+          /list <view>                    change the view: all, working, failed,
+                                          untested or denied
+          /probe <target>                 test now: a number, an id, or a view word
+          /forget <target>                drop the stored result (back to ?)
           /help                           list the selector commands
           /quit (or q)                    quit
 
@@ -1222,6 +1346,10 @@ internal sealed class ModelRegistry
 
     public bool IsError(string id) => _entries.TryGetValue(id, out var entry) && entry.State == ModelState.Error;
 
+    public bool IsDenied(string id) => _entries.TryGetValue(id, out var entry) && entry.State == ModelState.Denied;
+
+    public bool IsUntested(string id) => !_entries.TryGetValue(id, out var entry) || entry.State == ModelState.Unprobed;
+
     public bool IsInCatalog(string id) => !_entries.TryGetValue(id, out var entry) || entry.InCatalog;
 
     /// <summary>
@@ -1372,6 +1500,25 @@ internal sealed class ModelRegistry
         entry.LastError = detail;
         entry.LastProbe = DateTimeOffset.Now;
         return changed;
+    }
+
+    /// <summary>
+    /// Drops the stored result: the model goes back to "?" and is probed again
+    /// when it is selected. Returns false when there was nothing to forget.
+    /// </summary>
+    public bool Forget(string id)
+    {
+        if (!_entries.TryGetValue(id, out var entry)) return false;
+
+        var hadResult = entry.State != ModelState.Unprobed
+                        || entry.LastProbe is not null
+                        || entry.LastError is not null;
+
+        entry.State = ModelState.Unprobed;
+        entry.Reasoning = null;
+        entry.LastProbe = null;
+        entry.LastError = null;
+        return hadResult;
     }
 
     public void Save()

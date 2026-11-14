@@ -50,14 +50,15 @@ Models that work with your account (13 of 83) - 2 stale (revalidated when select
 
   Current: meta/muse-glimmer-30b  (✓R, last probe 1d ago)
   number = select · text = search · Enter = meta/muse-glimmer-30b · q = quit
-  /all full (83) · /works only ✓ · /probe test all · /retry ! only (10) · /help
+  /list all (83) · working (13) · failed (10) · untested (0) · denied (60)
+  /probe <target> now · /forget <target> reset · /help
 model>
 ```
 
 Each row has four parts:
 
 - **Number**: the position in the **full catalog**, the same number the model
-  has in the `/all` view. Typing `25` picks the same model in every view; a
+  has in the `/list all` view. Typing `25` picks the same model in every view; a
   filtered list shows gaps because it is a subset.
 - **State**: `?` never tested, `✓` responds with your account, `✗` rejected
   (400/403/404/410), `!` transient error (timeout, 429, 5xx, network), `∅` no
@@ -76,19 +77,33 @@ pick one and the app probes it before chatting.
 | `Enter` | Use the default model (last choice, or `minimaxai/minimax-m3.1-flash`) |
 | `25` | Pick the model at position 25 of the full catalog |
 | `nemotron` | Search by text; a single match is selected, several matches are numbered |
-| `/all` | Show the full catalog with every state |
-| `/works` | Go back to the list of models marked `✓` |
-| `/probe` | Test every model in the catalog (asks `y/N` first; skips `∅`) |
-| `/retry` | Test only the models marked `!` (no confirmation) |
+| `/list all` | Show the full catalog with every state |
+| `/list working` | Show only the models marked `✓` |
+| `/list failed` | Show only the models marked `!` |
+| `/list untested` | Show only the models marked `?` |
+| `/list denied` | Show only the models marked `✗` |
+| `/probe all` | Test every model in the catalog (asks `y/N` first; skips `∅`) |
+| `/probe failed` | Test only the models marked `!` (asks `y/N` first) |
+| `/probe 22` | Test the model at position 22 right now (no confirmation) |
+| `/probe <id>` | Test that model; a unique part of the id works too |
+| `/forget 22` | Drop the stored result: it goes back to `?` and is probed on selection |
 | `/help` | List the selector commands |
 | `/quit` or `q` | Quit without chatting |
 
 Anything that starts with `/` is a command; anything else is a number, an exact
-model id or a text search. That way `all`, `probe` or `works` can still be used
+model id or a text search. That way `all`, `probe` or `list` can still be used
 as search terms.
 
-`/probe` and `/retry` print one line per model as it finishes, then a summary with
-the elapsed time, and redraw the same view; they do not enter the chat.
+`/probe` and `/forget` take the same targets: `all`, `working`, `failed`,
+`untested`, `denied`, a full-catalog number, or a model id. A target that
+resolves to more than one model asks `y/N`; a single model does not.
+`/forget` never touches the network, it only clears `models.json`, so the model
+is probed again the next time it is selected.
+
+Every probe prints one line per model as it finishes, then a summary with the
+elapsed time, and redraws the same view; it does not enter the chat. `/probe all`
+runs without retries to stay fast; every other target uses
+`NVIDIA_PROBE_RETRIES`.
 
 ```
 ERROR   nvidia/llama-3.1-nemoguard-8b-content-safety  (HTTP 415)   [2/10]

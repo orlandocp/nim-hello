@@ -56,13 +56,18 @@ dotnet run -- --probe-all             # whole catalog, 3 concurrent, no retry
   Keep that invariant when touching `PrintModelList` or the number parsing.
 - `--probe-all` is optional: the selector probes any untested or stale model on
   demand. Never present the bulk command as a setup requirement.
-- `--probe-all` and the selector's `/probe` / `/retry` share `ProbeBatchAsync`
-  (3 concurrent, one live line per model, summary at the end). `/probe` and
-  `--probe-all` skip retries; `/retry` uses `NVIDIA_PROBE_RETRIES`. `/probe`
-  asks for confirmation and skips ids that left the catalog.
-- Selector commands start with `/` (`/all`, `/works`, `/probe`, `/retry`,
-  `/help`, `/quit`); anything else is a number, an exact id or a text search.
-  Keep the prefix rule: it is what allows searching for words like `probe`.
+- `--probe-all` and the selector's `/probe` share `ProbeBatchAsync` (3
+  concurrent, one live line per model, summary at the end). `/probe all` skips
+  retries and asks for confirmation; every other target uses
+  `NVIDIA_PROBE_RETRIES`, and a single model asks nothing.
+- Selector commands start with `/` (`/list`, `/probe`, `/forget`, `/help`,
+  `/quit`); anything else is a number, an exact id or a text search. Keep the
+  prefix rule: it is what allows searching for words like `probe`.
+- `/list` and `/probe` share one target vocabulary (`all`, `working`, `failed`,
+  `untested`, `denied`, a full-catalog number or an id) through
+  `ResolveTargets`. Add new targets there, not in the command handlers.
+- `/forget` only clears state in `models.json`; it never touches the network.
+  The model goes back to `unprobed` and is probed again when selected.
 - `/model` in the chat keeps `chatHistory`: switching models only changes the
   `model` field, because the API is stateless. Do not clear the history there.
   A 400/413 that mentions the context triggers `TrimHistory` (drops the oldest
