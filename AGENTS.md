@@ -70,8 +70,10 @@ dotnet run -- --probe-all             # whole catalog, 3 concurrent, no retry
   The model goes back to `unprobed` and is probed again when selected.
 - `/model` in the chat keeps `chatHistory`: switching models only changes the
   `model` field, because the API is stateless. Do not clear the history there.
-  A 400/413 that mentions the context triggers `TrimHistory` (drops the oldest
-  half in pairs, to keep user/assistant alternation) and one retry.
+  `/model <arg>` accepts a full-catalog number (the same positions the selector
+  shows), an exact id, or a unique part of an id. A 400/413 that mentions the
+  context triggers `TrimHistory` (drops the oldest half in pairs, to keep
+  user/assistant alternation) and one retry.
 - Reasoning models spend `max_tokens` on hidden reasoning; empty replies usually
   mean the token budget ran out.
 - Windows console output is set to UTF-8 so the `✓`/`✗`/`∅` markers render;

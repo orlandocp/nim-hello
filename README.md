@@ -173,7 +173,8 @@ successful reply and stores the result.
 | Command | Effect |
 |---------|--------|
 | `/model` | Open the model selector; the conversation is kept |
-| `/model <id or text>` | Switch directly (exact id, or a unique part of it) |
+| `/model 22` | Switch to position 22 of the full catalog (same number as the selector) |
+| `/model <id>` | Switch by exact id, or a unique part of it (`llama-3.2-90b`) |
 | `/thinking` | Show/hide the model's reasoning (in gray) |
 | `/reset` | Clear the conversation history |
 | `/quit` | Exit (also `/exit`) |
@@ -184,7 +185,7 @@ sends the full history to the new model.
 ```
 you> My name is Orlando. Reply with just OK.
 bot> OK
-you> /model meta/llama-3.2-90b-vision-instruct
+you> /model 22
 (model: meta/llama-3.2-90b-vision-instruct · 2 messages kept)
 you> What is my name? Answer with one word.
 bot> Orlando

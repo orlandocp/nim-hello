@@ -247,7 +247,7 @@ var ageText = registry.GetAge(model);
 Console.WriteLine();
 Console.WriteLine($"Model: {model}  (max_tokens: {maxTokens}, {registry.DescribeReasoning(model)}, " +
                   $"{(ageText == "n/a" ? "not probed" : $"last probe {ageText} ago")})");
-Console.WriteLine("Type your message. Commands: /model [id] (switch, keeps the conversation), /thinking, /reset, /quit.");
+Console.WriteLine("Type your message. Commands: /model [number|id] (switch, keeps the conversation), /thinking, /reset, /quit.");
 Console.WriteLine();
 
 while (true)
@@ -403,8 +403,8 @@ async Task<List<string>> GetCatalogAsync()
     return catalogCache;
 }
 
-// Resolves "/model <text>" to a model id: exact match first, then a unique
-// substring match.
+// Resolves "/model <arg>" to a model id: a full-catalog number, an exact
+// match, then a unique substring match.
 async Task<string?> ResolveModelAsync(string arg)
 {
     var catalog = await GetCatalogAsync();
@@ -412,6 +412,19 @@ async Task<string?> ResolveModelAsync(string arg)
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
         .ToList();
+
+    // Numbers are positions in the full catalog, the same number the selector
+    // uses. No model id is purely numeric, so this cannot shadow a search.
+    if (int.TryParse(arg, out var n))
+    {
+        if (n < 1 || n > all.Count)
+        {
+            Console.WriteLine($"  There is no number {n} (the full catalog has {all.Count}).");
+            return null;
+        }
+
+        return all[n - 1];
+    }
 
     var exact = all.FirstOrDefault(id => id.Equals(arg, StringComparison.OrdinalIgnoreCase));
     if (exact is not null) return exact;
@@ -1075,7 +1088,7 @@ static void PrintHelp()
           /quit (or q)                    quit
 
         In the chat:
-          /model [id]                     switch model, keeping the conversation
+          /model [number|id]              switch model, keeping the conversation
           /thinking                       show or hide the reasoning
           /reset                          clear the conversation
           /quit                           exit
