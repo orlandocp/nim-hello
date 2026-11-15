@@ -15,13 +15,20 @@ No external packages: just `HttpClient` + `System.Text.Json`.
 
 ## 2. Configure the key
 
-Save your key to the `.key` file in the project folder:
+The key is read from the first of these that exists and is non-empty:
+
+1. `NVIDIA_KEY_FILE` — path to a file containing the key
+2. `.key` in `NIM_HOME` (default: the current folder)
+3. `%USERPROFILE%\.nim\.key` — shared location, outside any repo
+
+Keeping it outside the repo is the recommended setup:
 
 ```powershell
-Set-Content -NoNewline .key "nvapi-your-key"
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.nim" | Out-Null
+Set-Content -NoNewline "$env:USERPROFILE\.nim\.key" "nvapi-your-key"
 ```
 
-The app reads the key **only** from that file.
+When no key is found, the app lists every path it tried.
 
 > `.key` is listed in `.gitignore`. Never commit your key.
 
@@ -216,7 +223,7 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 |------|---------|
 | `models.json` | External model list: `state`, `reasoning`, `lastProbe`, `lastError`, `inCatalog` (generated) |
 | `.model` | Last selector choice, used as the default next time (generated) |
-| `.key` | Your NVIDIA API key (the only key source; gitignored) |
+| `.key` | Your NVIDIA API key; resolved from `NVIDIA_KEY_FILE`, `NIM_HOME\.key` or `%USERPROFILE%\.nim\.key` (gitignored) |
 
 ## Environment variables
 
@@ -224,7 +231,8 @@ $env:NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"; dotnet run
 |----------|---------|---------|
 | `NVIDIA_MODEL` | — | Model to use; skips the menu |
 | `NVIDIA_MAX_TOKENS` | `2048` | Max tokens per reply (includes reasoning) |
-| `NIM_HOME` | current folder | Where to find `models.json`, `.model` and `.key` |
+| `NVIDIA_KEY_FILE` | — | Path to a file holding the key; wins over the default locations |
+| `NIM_HOME` | current folder | Where to find `models.json` and `.model` (and `.key`, if no key file is found earlier) |
 | `NVIDIA_PROBE_TIMEOUT` | `30` | Seconds per probe attempt |
 | `NVIDIA_PROBE_RETRIES` | `1` | Retries for transient probe failures (timeout, 429, 5xx, network) |
 | `NVIDIA_REPROBE_OK_DAYS` | `7` | Revalidate working models after N days |

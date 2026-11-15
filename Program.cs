@@ -13,7 +13,8 @@ const int DefaultOkDays = 7;
 const int DefaultErrorMinutes = 60;
 const int DefaultDeniedDays = 30;
 
-// Folder where models.json, .model and .key live (current directory by default).
+// Folder where models.json and .model live (current directory by default).
+// The key is resolved separately, see below.
 var nimHome = Environment.GetEnvironmentVariable("NIM_HOME");
 if (string.IsNullOrWhiteSpace(nimHome)) nimHome = Directory.GetCurrentDirectory();
 nimHome = Path.GetFullPath(nimHome);
@@ -44,17 +45,32 @@ if (modelFlag >= 0)
     argv.RemoveRange(modelFlag, 2);
 }
 
-// --- API key: read only from the .key file ---
-string? apiKey = null;
-if (File.Exists(keyPath))
+// --- API key: NVIDIA_KEY_FILE, then <NIM_HOME>\.key, then %USERPROFILE%\.nim\.key ---
+var keyCandidates = new List<string>();
+var keyFileEnv = Environment.GetEnvironmentVariable("NVIDIA_KEY_FILE");
+if (!string.IsNullOrWhiteSpace(keyFileEnv))
 {
-    try { apiKey = File.ReadAllText(keyPath).Trim(); } catch { /* reported below */ }
+    keyCandidates.Add(Path.GetFullPath(Environment.ExpandEnvironmentVariables(keyFileEnv.Trim())));
+}
+keyCandidates.Add(keyPath);
+keyCandidates.Add(Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nim", ".key"));
+var keyPaths = keyCandidates.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+string? apiKey = null;
+foreach (var candidate in keyPaths)
+{
+    if (!File.Exists(candidate)) continue;
+    try { apiKey = File.ReadAllText(candidate).Trim(); } catch { continue; }
+    if (!string.IsNullOrWhiteSpace(apiKey)) break;
+    apiKey = null;
 }
 
 if (string.IsNullOrWhiteSpace(apiKey))
 {
-    Console.Error.WriteLine("Missing API key.");
-    Console.Error.WriteLine($@"Save your key to: {keyPath}");
+    Console.Error.WriteLine("Missing API key. Looked in:");
+    foreach (var candidate in keyPaths) Console.Error.WriteLine($"  {candidate}");
+    Console.Error.WriteLine("Set NVIDIA_KEY_FILE, or save the key to one of the paths above.");
     return 1;
 }
 

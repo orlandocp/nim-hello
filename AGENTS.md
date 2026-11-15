@@ -29,8 +29,10 @@ dotnet run -- --probe-all             # whole catalog, 3 concurrent, no retry
 ## Gotchas
 
 - Every invocation, including `--models` and `--probe`, reads the key at startup
-  and exits with `Missing API key.` if `.key` is absent in `NIM_HOME`
-  (default: current directory). Diagnostics are not key-free.
+  and exits with `Missing API key.` if none is found. Resolution order:
+  `NVIDIA_KEY_FILE`, then `.key` in `NIM_HOME` (default: current directory),
+  then `%USERPROFILE%\.nim\.key`. The error lists every path tried.
+  Diagnostics are not key-free.
 - Running with no args enters the interactive selector and makes live API calls.
   A model that does not respond hangs until the 120s stream timeout (30s for the
   probe). Do not run it in automated checks without cutting it off.
